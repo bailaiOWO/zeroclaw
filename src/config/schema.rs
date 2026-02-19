@@ -212,7 +212,7 @@ fn default_agent_max_tool_iterations() -> usize {
 }
 
 fn default_agent_max_history_messages() -> usize {
-    50
+    100
 }
 
 fn default_agent_tool_dispatcher() -> String {
@@ -2476,7 +2476,7 @@ default_temperature = 0.7
         let cfg = AgentConfig::default();
         assert!(!cfg.compact_context);
         assert_eq!(cfg.max_tool_iterations, 10);
-        assert_eq!(cfg.max_history_messages, 50);
+        assert_eq!(cfg.max_history_messages, 100);
         assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
     }

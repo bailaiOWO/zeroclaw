@@ -40,6 +40,7 @@ impl Channel for CliChannel {
             let msg = ChannelMessage {
                 id: Uuid::new_v4().to_string(),
                 sender: "user".to_string(),
+                sender_name: None,
                 reply_target: "user".to_string(),
                 content: line,
                 channel: "cli".to_string(),
@@ -103,6 +104,7 @@ mod tests {
         let msg = ChannelMessage {
             id: "test-id".into(),
             sender: "user".into(),
+            sender_name: None,
             reply_target: "user".into(),
             content: "hello".into(),
             channel: "cli".into(),
@@ -121,6 +123,7 @@ mod tests {
         let msg = ChannelMessage {
             id: "id".into(),
             sender: "s".into(),
+            sender_name: None,
             reply_target: "s".into(),
             content: "c".into(),
             channel: "ch".into(),

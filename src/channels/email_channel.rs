@@ -430,6 +430,7 @@ impl Channel for EmailChannel {
                             id,
                             reply_target: sender.clone(),
                             sender,
+                            sender_name: None,
                             content,
                             channel: "email".to_string(),
                             timestamp: ts,

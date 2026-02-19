@@ -12,6 +12,7 @@ use axum::{
 };
 use serde_json::json;
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use uuid::Uuid;
 
@@ -98,10 +99,8 @@ impl OneBotV11Channel {
         }
 
         let self_id = event.self_id.as_ref().and_then(json_value_to_string);
-        let raw_message = event
-            .raw_message
-            .clone()
-            .or_else(|| extract_message_text(&event.message));
+        let raw_message = event.raw_message.clone();
+        let parsed_text = extract_message_text(&event.message).or_else(|| raw_message.clone());
 
         let reply_target = match event.message_type.as_str() {
             "private" => format!("private:{user_id}"),
@@ -116,7 +115,8 @@ impl OneBotV11Channel {
                     let to_me = event.to_me.unwrap_or(false);
                     let mentioned = raw_message
                         .as_deref()
-                        .is_some_and(|msg| message_mentions_self(msg, self_id.as_deref()));
+                        .is_some_and(|msg| message_mentions_self(msg, self_id.as_deref()))
+                        || message_segments_mention_self(&event.message, self_id.as_deref());
                     if !to_me && !mentioned {
                         return None;
                     }
@@ -136,9 +136,8 @@ impl OneBotV11Channel {
             return None;
         }
 
-        let parsed_text = extract_message_text(&event.message).or(raw_message);
         let content = parsed_text
-            .map(|text| strip_cq_codes(&text))
+            .map(|text| normalize_incoming_message_text(&text))
             .unwrap_or_default()
             .trim()
             .to_string();
@@ -147,6 +146,18 @@ impl OneBotV11Channel {
             return None;
         }
 
+        let sender_name = event.sender.as_ref().and_then(|s| {
+            s.card
+                .as_deref()
+                .filter(|c| !c.trim().is_empty())
+                .or_else(|| {
+                    s.nickname
+                        .as_deref()
+                        .filter(|n| !n.trim().is_empty())
+                })
+                .map(ToString::to_string)
+        });
+
         Some(ChannelMessage {
             id: if message_id.is_empty() {
                 Uuid::new_v4().to_string()
@@ -154,6 +165,7 @@ impl OneBotV11Channel {
                 message_id
             },
             sender: user_id,
+            sender_name,
             reply_target,
             content,
             channel: "onebot_v11".to_string(),
@@ -347,10 +359,97 @@ impl Channel for OneBotV11Channel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let (action, mut body) = Self::parse_recipient(&message.recipient)?;
-        body["message"] = json!(message.content);
+        // Strip internal tool-call tags to avoid leaking markup into QQ.
+        let content = strip_tool_call_tags(&message.content);
 
-        self.call_api(action, body).await?;
+        let (action, mut body) = Self::parse_recipient(&message.recipient)?;
+
+        let (mut text_without_markers, mut attachments) = parse_attachment_markers(&content);
+        if attachments.is_empty() {
+            if let Some(att) = parse_path_only_attachment(&content) {
+                attachments.push(att);
+                text_without_markers = String::new();
+            }
+        }
+
+        let mut media_segments: Vec<serde_json::Value> = Vec::new();
+        let mut documents: Vec<OneBotAttachment> = Vec::new();
+
+        for attachment in attachments {
+            match attachment.kind {
+                OneBotAttachmentKind::Document => documents.push(attachment),
+                kind => {
+                    media_segments.push(json!({
+                        "type": kind.to_segment_type(),
+                        "data": { "file": attachment.target }
+                    }));
+                }
+            }
+        }
+
+        // OneBot v11 documents/files are typically delivered via upload_*_file actions.
+        if !documents.is_empty() {
+            let (upload_action, id_key) = if action == "send_group_msg" {
+                ("upload_group_file", "group_id")
+            } else {
+                ("upload_private_file", "user_id")
+            };
+
+            let id_value = body.get(id_key).cloned().unwrap_or(serde_json::Value::Null);
+
+            for doc in documents {
+                let target = doc.target.strip_prefix("file://").unwrap_or(&doc.target);
+
+                if is_http_url(target) {
+                    if !text_without_markers.is_empty() {
+                        text_without_markers.push('\n');
+                    }
+                    text_without_markers.push_str(&format!("文件链接: {target}"));
+                    continue;
+                }
+
+                if !Path::new(target).exists() {
+                    if !text_without_markers.is_empty() {
+                        text_without_markers.push('\n');
+                    }
+                    text_without_markers.push_str(&format!("文件不存在: {target}"));
+                    continue;
+                }
+
+                let name = Path::new(target)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file");
+
+                let mut payload = json!({
+                    "file": target,
+                    "name": name,
+                });
+                payload[id_key] = id_value.clone();
+
+                self.call_api(upload_action, payload).await?;
+            }
+        }
+
+        // Send regular text / media segments.
+        if !text_without_markers.trim().is_empty() || !media_segments.is_empty() {
+            if media_segments.is_empty() {
+                body["message"] = json!(text_without_markers);
+            } else {
+                let mut segments = Vec::new();
+                if !text_without_markers.trim().is_empty() {
+                    segments.push(json!({
+                        "type": "text",
+                        "data": { "text": text_without_markers }
+                    }));
+                }
+                segments.extend(media_segments);
+                body["message"] = json!(segments);
+            }
+
+            self.call_api(action, body).await?;
+        }
+
         Ok(())
     }
 
@@ -385,6 +484,16 @@ struct OneBotEvent {
     time: Option<u64>,
     #[serde(default)]
     to_me: Option<bool>,
+    #[serde(default)]
+    sender: Option<OneBotSender>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct OneBotSender {
+    #[serde(default)]
+    nickname: Option<String>,
+    #[serde(default)]
+    card: Option<String>,
 }
 
 fn normalize_api_url(url: &str) -> String {
@@ -422,20 +531,204 @@ fn json_value_to_string(value: &serde_json::Value) -> Option<String> {
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OneBotAttachmentKind {
+    Image,
+    Document,
+    Video,
+    Record,
+}
+
+impl OneBotAttachmentKind {
+    fn from_marker(kind: &str) -> Option<Self> {
+        match kind.trim().to_ascii_uppercase().as_str() {
+            "IMAGE" | "PHOTO" => Some(Self::Image),
+            "DOCUMENT" | "FILE" => Some(Self::Document),
+            "VIDEO" => Some(Self::Video),
+            "AUDIO" | "VOICE" | "RECORD" => Some(Self::Record),
+            _ => None,
+        }
+    }
+
+    fn to_segment_type(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Video => "video",
+            Self::Record => "record",
+            // OneBot v11 does not standardize "file" message segments across implementations;
+            // for documents we use upload_*_file APIs.
+            Self::Document => "file",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OneBotAttachment {
+    kind: OneBotAttachmentKind,
+    target: String,
+}
+
+fn is_http_url(target: &str) -> bool {
+    target.starts_with("http://") || target.starts_with("https://")
+}
+
+fn infer_attachment_kind_from_target(target: &str) -> OneBotAttachmentKind {
+    let normalized = target
+        .split('?')
+        .next()
+        .unwrap_or(target)
+        .split('#')
+        .next()
+        .unwrap_or(target);
+
+    let extension = Path::new(normalized)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    match extension.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => OneBotAttachmentKind::Image,
+        "mp4" | "mov" | "mkv" | "avi" | "webm" => OneBotAttachmentKind::Video,
+        "mp3" | "m4a" | "wav" | "flac" | "ogg" | "oga" | "opus" => OneBotAttachmentKind::Record,
+        _ => OneBotAttachmentKind::Document,
+    }
+}
+
+fn parse_path_only_attachment(message: &str) -> Option<OneBotAttachment> {
+    let trimmed = message.trim();
+    if trimmed.is_empty() || trimmed.contains('\n') {
+        return None;
+    }
+
+    let candidate = trimmed.trim_matches(|c| matches!(c, '`' | '"' | '\''));
+    if candidate.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    let candidate = candidate.strip_prefix("file://").unwrap_or(candidate);
+
+    if !is_http_url(candidate) && !Path::new(candidate).exists() {
+        return None;
+    }
+
+    Some(OneBotAttachment {
+        kind: infer_attachment_kind_from_target(candidate),
+        target: candidate.to_string(),
+    })
+}
+
+fn parse_attachment_markers(message: &str) -> (String, Vec<OneBotAttachment>) {
+    let mut cleaned = String::with_capacity(message.len());
+    let mut attachments = Vec::new();
+    let mut cursor = 0;
+
+    while cursor < message.len() {
+        let Some(open_rel) = message[cursor..].find('[') else {
+            cleaned.push_str(&message[cursor..]);
+            break;
+        };
+
+        let open = cursor + open_rel;
+        cleaned.push_str(&message[cursor..open]);
+
+        let Some(close_rel) = message[open..].find(']') else {
+            cleaned.push_str(&message[open..]);
+            break;
+        };
+
+        let close = open + close_rel;
+        let marker = &message[open + 1..close];
+
+        let parsed = marker.split_once(':').and_then(|(kind, target)| {
+            let kind = OneBotAttachmentKind::from_marker(kind)?;
+            let target = target.trim();
+            if target.is_empty() {
+                return None;
+            }
+            Some(OneBotAttachment {
+                kind,
+                target: target.to_string(),
+            })
+        });
+
+        if let Some(attachment) = parsed {
+            attachments.push(attachment);
+        } else {
+            cleaned.push_str(&message[open..=close]);
+        }
+
+        cursor = close + 1;
+    }
+
+    (cleaned.trim().to_string(), attachments)
+}
+
+fn strip_tool_call_tags(message: &str) -> String {
+    let mut result = message.to_string();
+    for (open, close) in [
+        ("<tool>", "</tool>"),
+        ("<toolcall>", "</toolcall>"),
+        ("<tool-call>", "</tool-call>"),
+    ] {
+        while let Some(start) = result.find(open) {
+            if let Some(end) = result[start..].find(close) {
+                let end = start + end + close.len();
+                result = format!("{}{}", &result[..start], &result[end..]);
+            } else {
+                break;
+            }
+        }
+    }
+
+    while result.contains("\n\n\n") {
+        result = result.replace("\n\n\n", "\n\n");
+    }
+
+    result.trim().to_string()
+}
+
 fn extract_message_text(message: &serde_json::Value) -> Option<String> {
     match message {
         serde_json::Value::String(s) => Some(s.to_string()),
         serde_json::Value::Array(segments) => {
             let mut buf = String::new();
             for seg in segments {
-                if seg.get("type").and_then(|v| v.as_str()) == Some("text") {
-                    if let Some(text) = seg
-                        .get("data")
-                        .and_then(|v| v.get("text"))
-                        .and_then(|v| v.as_str())
-                    {
-                        buf.push_str(text);
+                let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match seg_type {
+                    "text" => {
+                        if let Some(text) = seg
+                            .get("data")
+                            .and_then(|v| v.get("text"))
+                            .and_then(|v| v.as_str())
+                        {
+                            buf.push_str(text);
+                        }
                     }
+                    "image" | "video" | "record" | "file" => {
+                        let data = seg.get("data");
+                        let target = data
+                            .and_then(|d| d.get("url"))
+                            .and_then(|v| v.as_str())
+                            .or_else(|| data.and_then(|d| d.get("file")).and_then(|v| v.as_str()))
+                            .or_else(|| data.and_then(|d| d.get("name")).and_then(|v| v.as_str()))
+                            .unwrap_or("");
+                        if target.is_empty() {
+                            continue;
+                        }
+                        if !buf.is_empty() && !buf.ends_with('\n') && !buf.ends_with(' ') {
+                            buf.push('\n');
+                        }
+                        let marker = match seg_type {
+                            "image" => format!("[IMAGE:{target}]"),
+                            "video" => format!("[VIDEO:{target}]"),
+                            "record" => format!("[VOICE:{target}]"),
+                            "file" => format!("[DOCUMENT:{target}]"),
+                            _ => continue,
+                        };
+                        buf.push_str(&marker);
+                    }
+                    _ => {}
                 }
             }
             if buf.is_empty() {
@@ -457,11 +750,89 @@ fn strip_cq_codes(text: &str) -> String {
     cq_regex().replace_all(text, "").to_string()
 }
 
+fn cq_code_to_marker(code: &str) -> Option<String> {
+    let code = code.strip_prefix("CQ:")?;
+    let mut parts = code.split(',');
+    let kind = parts.next()?.trim();
+
+    let mut file: Option<&str> = None;
+    let mut url: Option<&str> = None;
+    let mut name: Option<&str> = None;
+
+    for part in parts {
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        let v = v.trim();
+        match k.trim() {
+            "file" => file = Some(v),
+            "url" => url = Some(v),
+            "name" => name = Some(v),
+            _ => {}
+        }
+    }
+
+    let target = url.or(file).or(name)?.trim();
+    if target.is_empty() {
+        return None;
+    }
+
+    match kind {
+        "image" => Some(format!("[IMAGE:{target}]")),
+        "record" => Some(format!("[VOICE:{target}]")),
+        "video" => Some(format!("[VIDEO:{target}]")),
+        "file" => Some(format!("[DOCUMENT:{target}]")),
+        _ => None,
+    }
+}
+
+fn replace_cq_codes_with_markers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+
+    for m in cq_regex().find_iter(text) {
+        out.push_str(&text[cursor..m.start()]);
+        let code = &text[m.start() + 1..m.end() - 1];
+        if let Some(marker) = cq_code_to_marker(code) {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&marker);
+        }
+        cursor = m.end();
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+fn normalize_incoming_message_text(text: &str) -> String {
+    let replaced = replace_cq_codes_with_markers(text);
+    strip_cq_codes(&replaced)
+}
+
 fn message_mentions_self(message: &str, self_id: Option<&str>) -> bool {
     let Some(id) = self_id else {
         return false;
     };
     message.contains(&format!("[CQ:at,qq={id}]")) || message.contains(&format!("[CQ:at,qq={id},"))
+}
+
+fn message_segments_mention_self(message: &serde_json::Value, self_id: Option<&str>) -> bool {
+    let Some(id) = self_id else {
+        return false;
+    };
+    let serde_json::Value::Array(segments) = message else {
+        return false;
+    };
+
+    segments.iter().any(|seg| {
+        seg.get("type").and_then(|v| v.as_str()) == Some("at")
+            && seg
+                .get("data")
+                .and_then(|d| d.get("qq"))
+                .and_then(json_value_to_string)
+                .is_some_and(|qq| qq == id)
+    })
 }
 
 fn extract_access_token(headers: &HeaderMap) -> Option<String> {

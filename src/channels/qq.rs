@@ -352,6 +352,7 @@ impl Channel for QQChannel {
                             let channel_msg = ChannelMessage {
                                 id: Uuid::new_v4().to_string(),
                                 sender: user_openid.to_string(),
+                                sender_name: None,
                                 reply_target: chat_id,
                                 content: content.to_string(),
                                 channel: "qq".to_string(),
@@ -390,6 +391,7 @@ impl Channel for QQChannel {
                             let channel_msg = ChannelMessage {
                                 id: Uuid::new_v4().to_string(),
                                 sender: author_id.to_string(),
+                                sender_name: None,
                                 reply_target: chat_id,
                                 content: content.to_string(),
                                 channel: "qq".to_string(),

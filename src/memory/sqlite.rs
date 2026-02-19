@@ -611,19 +611,37 @@ impl Memory for SqliteMemory {
 
         if let Some(cat) = category {
             let cat_str = Self::category_to_str(cat);
+
+            if let Some(sid) = session_id {
+                let mut stmt = conn.prepare(
+                    "SELECT id, key, content, category, created_at, session_id FROM memories
+                     WHERE category = ?1 AND session_id = ?2
+                     ORDER BY updated_at DESC",
+                )?;
+                let rows = stmt.query_map(params![cat_str, sid], row_mapper)?;
+                for row in rows {
+                    results.push(row?);
+                }
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT id, key, content, category, created_at, session_id FROM memories
+                     WHERE category = ?1
+                     ORDER BY updated_at DESC",
+                )?;
+                let rows = stmt.query_map(params![cat_str], row_mapper)?;
+                for row in rows {
+                    results.push(row?);
+                }
+            }
+        } else if let Some(sid) = session_id {
             let mut stmt = conn.prepare(
                 "SELECT id, key, content, category, created_at, session_id FROM memories
-                 WHERE category = ?1 ORDER BY updated_at DESC",
+                 WHERE session_id = ?1
+                 ORDER BY updated_at DESC",
             )?;
-            let rows = stmt.query_map(params![cat_str], row_mapper)?;
+            let rows = stmt.query_map(params![sid], row_mapper)?;
             for row in rows {
-                let entry = row?;
-                if let Some(sid) = session_id {
-                    if entry.session_id.as_deref() != Some(sid) {
-                        continue;
-                    }
-                }
-                results.push(entry);
+                results.push(row?);
             }
         } else {
             let mut stmt = conn.prepare(
@@ -632,13 +650,7 @@ impl Memory for SqliteMemory {
             )?;
             let rows = stmt.query_map([], row_mapper)?;
             for row in rows {
-                let entry = row?;
-                if let Some(sid) = session_id {
-                    if entry.session_id.as_deref() != Some(sid) {
-                        continue;
-                    }
-                }
-                results.push(entry);
+                results.push(row?);
             }
         }
 

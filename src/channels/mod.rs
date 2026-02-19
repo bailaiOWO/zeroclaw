@@ -59,6 +59,11 @@ const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
 /// Timeout for processing a single channel message (LLM + tools).
 /// 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
 const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
+/// Maximum number of prior chat messages injected into the channel prompt.
+/// Keeps the channel runtime responsive and prevents runaway token growth.
+const CHANNEL_MAX_HISTORY_MESSAGES: usize = 200;
+/// Max characters persisted per autosaved chat turn.
+const CHANNEL_AUTOSAVE_MAX_CHARS: usize = 4_000;
 const CHANNEL_PARALLELISM_PER_CHANNEL: usize = 4;
 const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
@@ -75,16 +80,142 @@ struct ChannelRuntimeContext {
     temperature: f64,
     auto_save_memory: bool,
     max_tool_iterations: usize,
+    max_history_messages: usize,
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.sender, msg.id)
 }
 
+fn conversation_session_id(msg: &traits::ChannelMessage) -> String {
+    // Session scoping decides how conversation history is grouped.
+    //
+    // Default: keep sessions isolated per-user per conversation target to prevent cross-user
+    // leakage on shared channels.
+    //
+    // OneBot v11 (NapCat): we want group conversations to share context across members,
+    // and private chats are naturally user-scoped by reply_target.
+    if msg.channel == "onebot_v11" {
+        return format!("{}:{}", msg.channel, msg.reply_target);
+    }
+
+    format!("{}:{}:{}", msg.channel, msg.reply_target, msg.sender)
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StoredConversationTurn {
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    sender_id: Option<String>,
+    #[serde(default)]
+    sender_name: Option<String>,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    reply_target: Option<String>,
+    #[serde(default)]
+    timestamp: Option<u64>,
+}
+
+async fn load_conversation_history(
+    mem: &dyn Memory,
+    session_id: &str,
+    max_messages: usize,
+) -> Vec<ChatMessage> {
+    if max_messages == 0 {
+        return Vec::new();
+    }
+
+    let Ok(mut entries) = mem
+        .list(Some(&memory::MemoryCategory::Conversation), Some(session_id))
+        .await
+    else {
+        return Vec::new();
+    };
+
+    // Keep most-recent N (sqlite list is updated_at DESC)
+    entries.truncate(max_messages);
+    entries.reverse();
+
+    let label_group_senders = session_id
+        .split_once(':')
+        .map(|(_, rest)| rest.starts_with("group:"))
+        .unwrap_or(false);
+
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let fallback_role = if entry.key.ends_with("_assistant") {
+            "assistant"
+        } else {
+            "user"
+        };
+
+        let mut role = fallback_role.to_string();
+        let mut text = entry.content.clone();
+        let mut sender_id: Option<String> = None;
+        let mut sender_name: Option<String> = None;
+
+        if let Ok(parsed) = serde_json::from_str::<StoredConversationTurn>(&entry.content) {
+            if !parsed.role.trim().is_empty() {
+                role = parsed.role;
+            }
+            if !parsed.text.is_empty() {
+                text = parsed.text;
+            }
+            sender_id = parsed.sender_id;
+            sender_name = parsed.sender_name;
+        }
+
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+
+        match role.as_str() {
+            "assistant" => out.push(ChatMessage::assistant(text)),
+            "user" => {
+                let formatted = if label_group_senders {
+                    match (
+                        sender_name.as_deref().filter(|s| !s.trim().is_empty()),
+                        sender_id.as_deref().filter(|s| !s.trim().is_empty()),
+                    ) {
+                        (Some(name), Some(id)) => format!("{name}({id}): {text}"),
+                        (Some(name), None) => format!("{name}: {text}"),
+                        (None, Some(id)) => format!("{id}: {text}"),
+                        (None, None) => text.to_string(),
+                    }
+                } else {
+                    text.to_string()
+                };
+                out.push(ChatMessage::user(formatted));
+            }
+            _ => {
+                // Unknown role — treat as user content to avoid losing context.
+                out.push(ChatMessage::user(text));
+            }
+        }
+    }
+
+    out
+}
+
 fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     match channel_name {
         "telegram" => Some(
             "When responding on Telegram, include media markers for files or URLs that should be sent as attachments. Use one marker per attachment with this exact syntax: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]. Keep normal user-facing text outside markers and never wrap markers in code fences.",
+        ),
+        "onebot_v11" => Some(
+            "When responding on QQ (NapCat / OneBot v11), include media markers for files or URLs that should be sent as attachments. Use one marker per attachment with this exact syntax: [IMAGE:<path-or-url>], [DOCUMENT:<local-path>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]. Keep normal user-facing text outside markers and never wrap markers in code fences.",
         ),
         _ => None,
     }
@@ -107,6 +238,11 @@ async fn build_memory_context(mem: &dyn Memory, user_msg: &str) -> String {
     let mut context = String::new();
 
     if let Ok(entries) = mem.recall(user_msg, 5, None).await {
+        let entries: Vec<_> = entries
+            .into_iter()
+            .filter(|e| e.category != crate::memory::MemoryCategory::Conversation)
+            .collect();
+
         if !entries.is_empty() {
             context.push_str("[Memory context]\n");
             for entry in &entries {
@@ -117,6 +253,34 @@ async fn build_memory_context(mem: &dyn Memory, user_msg: &str) -> String {
     }
 
     context
+}
+
+fn channel_sender_context(msg: &traits::ChannelMessage) -> Option<String> {
+    if msg.channel != "onebot_v11" {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    lines.push("平台：QQ (NapCat/OneBot v11)".to_string());
+
+    if let Some(group_id) = msg.reply_target.strip_prefix("group:") {
+        lines.push("对话类型：群聊".to_string());
+        lines.push(format!("群号：{group_id}"));
+    } else if let Some(user_id) = msg
+        .reply_target
+        .strip_prefix("private:")
+        .or_else(|| msg.reply_target.strip_prefix("user:"))
+    {
+        lines.push("对话类型：私聊".to_string());
+        lines.push(format!("会话：{user_id}"));
+    }
+
+    lines.push(format!("对方QQ：{}", msg.sender));
+    if let Some(name) = msg.sender_name.as_deref().filter(|s| !s.trim().is_empty()) {
+        lines.push(format!("对方昵称：{name}"));
+    }
+
+    Some(format!("【对话信息】\n{}\n【/对话信息】", lines.join("\n")))
 }
 
 fn spawn_supervised_listener(
@@ -182,17 +346,39 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         truncate_with_ellipsis(&msg.content, 80)
     );
 
+    let session_id = conversation_session_id(&msg);
+
     let memory_context = build_memory_context(ctx.memory.as_ref(), &msg.content).await;
+
+    let history_limit = ctx
+        .max_history_messages
+        .min(CHANNEL_MAX_HISTORY_MESSAGES);
+    let conversation_history = if ctx.auto_save_memory {
+        load_conversation_history(ctx.memory.as_ref(), &session_id, history_limit).await
+    } else {
+        Vec::new()
+    };
 
     if ctx.auto_save_memory {
         let autosave_key = conversation_memory_key(&msg);
+        let stored_text = truncate_with_ellipsis(&msg.content, CHANNEL_AUTOSAVE_MAX_CHARS);
+        let stored = serde_json::to_string(&StoredConversationTurn {
+            role: "user".to_string(),
+            text: stored_text.clone(),
+            sender_id: Some(msg.sender.clone()),
+            sender_name: msg.sender_name.clone(),
+            channel: Some(msg.channel.clone()),
+            reply_target: Some(msg.reply_target.clone()),
+            timestamp: Some(msg.timestamp),
+        })
+        .unwrap_or(stored_text);
         let _ = ctx
             .memory
             .store(
                 &autosave_key,
-                &msg.content,
+                &stored,
                 crate::memory::MemoryCategory::Conversation,
-                None,
+                Some(&session_id),
             )
             .await;
     }
@@ -216,10 +402,13 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
 
     let system_prompt = compose_system_prompt_for_channel(ctx.system_prompt.as_str(), &msg.channel);
 
-    let mut history = vec![
-        ChatMessage::system(system_prompt.as_ref()),
-        ChatMessage::user(&enriched_message),
-    ];
+    let mut history = Vec::with_capacity(2 + conversation_history.len());
+    history.push(ChatMessage::system(system_prompt.as_ref()));
+    history.extend(conversation_history);
+    if let Some(sender_ctx) = channel_sender_context(&msg) {
+        history.push(ChatMessage::system(sender_ctx));
+    }
+    history.push(ChatMessage::user(&enriched_message));
 
     let llm_result = tokio::time::timeout(
         Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
@@ -252,6 +441,30 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 started_at.elapsed().as_millis(),
                 truncate_with_ellipsis(&response, 80)
             );
+
+            if ctx.auto_save_memory {
+                let autosave_key = format!("{}_assistant", conversation_memory_key(&msg));
+                let stored_text = truncate_with_ellipsis(&response, CHANNEL_AUTOSAVE_MAX_CHARS);
+                let stored = serde_json::to_string(&StoredConversationTurn {
+                    role: "assistant".to_string(),
+                    text: stored_text.clone(),
+                    sender_id: None,
+                    sender_name: None,
+                    channel: Some(msg.channel.clone()),
+                    reply_target: Some(msg.reply_target.clone()),
+                    timestamp: Some(now_unix_secs()),
+                })
+                .unwrap_or(stored_text);
+                let _ = ctx
+                    .memory
+                    .store(
+                        &autosave_key,
+                        &stored,
+                        crate::memory::MemoryCategory::Conversation,
+                        Some(&session_id),
+                    )
+                    .await;
+            }
             if let Some(channel) = target_channel.as_ref() {
                 if let Err(e) = channel
                     .send(&SendMessage::new(response, &msg.reply_target))
@@ -1306,6 +1519,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         temperature,
         auto_save_memory: config.memory.auto_save,
         max_tool_iterations: config.agent.max_tool_iterations,
+        max_history_messages: config.agent.max_history_messages,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -1531,6 +1745,7 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
+            max_history_messages: 0,
         });
 
         process_channel_message(
@@ -1538,6 +1753,7 @@ mod tests {
             traits::ChannelMessage {
                 id: "msg-1".to_string(),
                 sender: "alice".to_string(),
+                sender_name: None,
                 reply_target: "chat-42".to_string(),
                 content: "What is the BTC price now?".to_string(),
                 channel: "test-channel".to_string(),
@@ -1573,6 +1789,7 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
+            max_history_messages: 0,
         });
 
         process_channel_message(
@@ -1580,6 +1797,7 @@ mod tests {
             traits::ChannelMessage {
                 id: "msg-2".to_string(),
                 sender: "bob".to_string(),
+                sender_name: None,
                 reply_target: "chat-84".to_string(),
                 content: "What is the BTC price now?".to_string(),
                 channel: "test-channel".to_string(),
@@ -1669,12 +1887,14 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
+            max_history_messages: 0,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
         tx.send(traits::ChannelMessage {
             id: "1".to_string(),
             sender: "alice".to_string(),
+            sender_name: None,
             reply_target: "alice".to_string(),
             content: "hello".to_string(),
             channel: "test-channel".to_string(),
@@ -1685,6 +1905,7 @@ mod tests {
         tx.send(traits::ChannelMessage {
             id: "2".to_string(),
             sender: "bob".to_string(),
+            sender_name: None,
             reply_target: "bob".to_string(),
             content: "world".to_string(),
             channel: "test-channel".to_string(),
@@ -1966,6 +2187,7 @@ mod tests {
         let msg = traits::ChannelMessage {
             id: "msg_abc123".into(),
             sender: "U123".into(),
+            sender_name: None,
             reply_target: "C456".into(),
             content: "hello".into(),
             channel: "slack".into(),
@@ -1980,6 +2202,7 @@ mod tests {
         let msg1 = traits::ChannelMessage {
             id: "msg_1".into(),
             sender: "U123".into(),
+            sender_name: None,
             reply_target: "C456".into(),
             content: "first".into(),
             channel: "slack".into(),
@@ -1988,6 +2211,7 @@ mod tests {
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
             sender: "U123".into(),
+            sender_name: None,
             reply_target: "C456".into(),
             content: "second".into(),
             channel: "slack".into(),
@@ -2008,6 +2232,7 @@ mod tests {
         let msg1 = traits::ChannelMessage {
             id: "msg_1".into(),
             sender: "U123".into(),
+            sender_name: None,
             reply_target: "C456".into(),
             content: "I'm Paul".into(),
             channel: "slack".into(),
@@ -2016,6 +2241,7 @@ mod tests {
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
             sender: "U123".into(),
+            sender_name: None,
             reply_target: "C456".into(),
             content: "I'm 45".into(),
             channel: "slack".into(),

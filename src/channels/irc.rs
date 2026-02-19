@@ -566,6 +566,7 @@ impl Channel for IrcChannel {
                     let channel_msg = ChannelMessage {
                         id: format!("irc_{}_{seq}", chrono::Utc::now().timestamp_millis()),
                         sender: sender_nick.to_string(),
+                        sender_name: Some(sender_nick.to_string()),
                         reply_target: reply_to,
                         content,
                         channel: "irc".to_string(),

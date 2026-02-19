@@ -779,6 +779,9 @@ pub enum ConfigUpdate {
         model: String,
         api_key: Option<String>,
     },
+    Agent {
+        max_history_messages: usize,
+    },
     ChannelTelegram {
         bot_token: String,
     },
@@ -830,6 +833,9 @@ pub async fn handle_api_config_mutate(
                     config.api_key = Some(key);
                 }
             }
+        }
+        ConfigUpdate::Agent { max_history_messages } => {
+            config.agent.max_history_messages = max_history_messages;
         }
         ConfigUpdate::ChannelTelegram { bot_token } => {
             config.channels_config.telegram = Some(crate::config::TelegramConfig {
@@ -925,6 +931,219 @@ pub async fn handle_api_chat(
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
         }
     }
+}
+
+// ── Conversation history (from MemoryCategory::Conversation) ───────────────────
+
+#[derive(serde::Deserialize, Debug, Default)]
+pub struct ConversationsQuery {
+    pub channel: Option<String>,
+    /// group | private | other
+    pub kind: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(serde::Serialize, Debug, Clone)]
+pub struct ConversationSessionSummary {
+    pub session_id: String,
+    pub channel: String,
+    pub kind: String,
+    pub target: String,
+    pub last_timestamp: String,
+}
+
+/// GET /api/conversations — list conversation sessions.
+pub async fn handle_api_conversations_list(
+    State(state): State<AppState>,
+    Query(params): Query<ConversationsQuery>,
+) -> impl IntoResponse {
+    let entries = match state
+        .mem
+        .list(Some(&crate::memory::MemoryCategory::Conversation), None)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("WebUI conversations list error: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "无法读取聊天记录" })),
+            );
+        }
+    };
+
+    let channel_filter = params
+        .channel
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let kind_filter = params
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let limit = params.limit.unwrap_or(200).clamp(1, 2000);
+
+    let mut seen = HashSet::new();
+    let mut sessions: Vec<ConversationSessionSummary> = Vec::new();
+
+    // Memory.list() returns updated_at DESC for sqlite; we keep the first record per session.
+    for entry in entries {
+        let Some(session_id) = entry.session_id.as_deref() else {
+            continue;
+        };
+
+        if !seen.insert(session_id.to_string()) {
+            continue;
+        }
+
+        let (channel, rest) = session_id.split_once(':').unwrap_or((session_id, ""));
+
+        if let Some(expected) = channel_filter {
+            if channel != expected {
+                continue;
+            }
+        }
+
+        let kind = if rest.starts_with("group:") {
+            "group"
+        } else if rest.starts_with("private:") || rest.starts_with("user:") {
+            "private"
+        } else {
+            "other"
+        };
+
+        if let Some(expected) = kind_filter {
+            if kind != expected {
+                continue;
+            }
+        }
+
+        sessions.push(ConversationSessionSummary {
+            session_id: session_id.to_string(),
+            channel: channel.to_string(),
+            kind: kind.to_string(),
+            target: rest.to_string(),
+            last_timestamp: entry.timestamp,
+        });
+
+        if sessions.len() >= limit {
+            break;
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({ "sessions": sessions })))
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+pub struct ConversationMessagesQuery {
+    pub session_id: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+struct StoredConversationTurn {
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    sender_id: Option<String>,
+    #[serde(default)]
+    sender_name: Option<String>,
+    #[serde(default)]
+    timestamp: Option<u64>,
+}
+
+#[derive(serde::Serialize, Debug, Clone)]
+pub struct ConversationMessageView {
+    pub role: String,
+    pub text: String,
+    pub sender_id: Option<String>,
+    pub sender_name: Option<String>,
+    pub timestamp: Option<u64>,
+    pub created_at: String,
+    pub key: String,
+}
+
+/// GET /api/conversations/messages — list messages for a given session_id.
+pub async fn handle_api_conversations_messages(
+    State(state): State<AppState>,
+    Query(params): Query<ConversationMessagesQuery>,
+) -> impl IntoResponse {
+    let session_id = params.session_id.trim();
+    if session_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "session_id 不能为空" })),
+        );
+    }
+
+    let mut entries = match state
+        .mem
+        .list(
+            Some(&crate::memory::MemoryCategory::Conversation),
+            Some(session_id),
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("WebUI conversations messages error: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "无法读取会话消息" })),
+            );
+        }
+    };
+
+    let limit = params.limit.unwrap_or(500).clamp(1, 5000);
+    entries.truncate(limit);
+    entries.reverse();
+
+    let mut messages: Vec<ConversationMessageView> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let fallback_role = if entry.key.ends_with("_assistant") {
+            "assistant"
+        } else {
+            "user"
+        };
+
+        let mut role = fallback_role.to_string();
+        let mut text = entry.content.clone();
+        let mut sender_id: Option<String> = None;
+        let mut sender_name: Option<String> = None;
+        let mut timestamp: Option<u64> = None;
+
+        if let Ok(parsed) = serde_json::from_str::<StoredConversationTurn>(&entry.content) {
+            if !parsed.role.trim().is_empty() {
+                role = parsed.role;
+            }
+            if !parsed.text.trim().is_empty() {
+                text = parsed.text;
+            }
+            sender_id = parsed.sender_id;
+            sender_name = parsed.sender_name;
+            timestamp = parsed.timestamp;
+        }
+
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+
+        messages.push(ConversationMessageView {
+            role,
+            text,
+            sender_id,
+            sender_name,
+            timestamp,
+            created_at: entry.timestamp,
+            key: entry.key,
+        });
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({ "messages": messages })))
 }
 
 #[derive(serde::Serialize)]
@@ -1347,4 +1566,308 @@ pub async fn handle_api_service_mutate(
             Json(serde_json::json!({ "error": e.to_string() })),
         ),
     }
+}
+
+// ── WebUI Onboarding (首次引导) ───────────────────────────────────────────────
+
+fn webui_onboard_marker_path(workspace_dir: &std::path::Path) -> std::path::PathBuf {
+    workspace_dir
+        .join("state")
+        .join("webui_onboarded.json")
+}
+
+fn openclaw_scaffold_files() -> [&'static str; 8] {
+    [
+        "IDENTITY.md",
+        "AGENTS.md",
+        "HEARTBEAT.md",
+        "SOUL.md",
+        "USER.md",
+        "TOOLS.md",
+        "BOOTSTRAP.md",
+        "MEMORY.md",
+    ]
+}
+
+fn openclaw_scaffold_subdirs() -> [&'static str; 5] {
+    ["sessions", "memory", "state", "cron", "skills"]
+}
+
+/// GET /api/onboard/status — detect whether the first-run wizard should be shown.
+pub async fn handle_api_onboard_status(State(state): State<AppState>) -> impl IntoResponse {
+    let config = state.config.lock();
+    let workspace_dir = &config.workspace_dir;
+    let marker_exists = webui_onboard_marker_path(workspace_dir).exists();
+
+    let identity_is_aieos = config.identity.format.trim().eq_ignore_ascii_case("aieos");
+    let aieos_configured = crate::identity::is_aieos_configured(&config.identity);
+
+    let mut present_files: Vec<String> = Vec::new();
+    let mut missing_files: Vec<String> = Vec::new();
+    for f in openclaw_scaffold_files() {
+        let p = workspace_dir.join(f);
+        if p.is_file() {
+            present_files.push(f.to_string());
+        } else {
+            missing_files.push(f.to_string());
+        }
+    }
+
+    let mut present_subdirs: Vec<String> = Vec::new();
+    let mut missing_subdirs: Vec<String> = Vec::new();
+    for d in openclaw_scaffold_subdirs() {
+        let p = workspace_dir.join(d);
+        if p.is_dir() {
+            present_subdirs.push(d.to_string());
+        } else {
+            missing_subdirs.push(d.to_string());
+        }
+    }
+
+    let provider_ok = config
+        .default_provider
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+    let model_ok = config
+        .default_model
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+
+    let openclaw_files_ok = ["SOUL.md", "AGENTS.md", "IDENTITY.md", "USER.md"]
+        .iter()
+        .all(|f| workspace_dir.join(f).is_file());
+
+    let looks_configured = if identity_is_aieos {
+        provider_ok && model_ok && aieos_configured
+    } else {
+        provider_ok && model_ok && openclaw_files_ok
+    };
+
+    // We only force-show the wizard if there is no marker AND the setup doesn't look complete.
+    let needs_setup = !marker_exists && !looks_configured;
+
+    Json(serde_json::json!({
+        "onboard_done": marker_exists,
+        "needs_setup": needs_setup,
+        "config": {
+            "provider": config.default_provider.as_deref().unwrap_or("openrouter"),
+            "model": config.default_model.as_deref().unwrap_or(""),
+            "has_api_key": config.api_key.is_some(),
+            "api_url": config.api_url.as_deref().unwrap_or(""),
+            "identity_format": &config.identity.format,
+            "aieos_configured": aieos_configured,
+        },
+        "workspace": {
+            "present_files": present_files,
+            "missing_files": missing_files,
+            "present_subdirs": present_subdirs,
+            "missing_subdirs": missing_subdirs,
+        }
+    }))
+}
+
+#[derive(serde::Deserialize)]
+pub struct OnboardScaffoldReq {
+    #[serde(default)]
+    pub user_name: String,
+    #[serde(default)]
+    pub timezone: String,
+    #[serde(default)]
+    pub agent_name: String,
+    #[serde(default)]
+    pub communication_style: String,
+    #[serde(default = "default_true")]
+    pub mark_done: bool,
+    #[serde(default)]
+    pub communication_language: String,
+    #[serde(default)]
+    pub refresh_personalization: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn refresh_onboard_personalization_files(
+    workspace_dir: &std::path::Path,
+    ctx: &crate::onboard::wizard::ProjectContext,
+) -> std::io::Result<Vec<String>> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp_dir = std::env::temp_dir().join(format!(
+        "zeroclaw_onboard_refresh_{}_{}",
+        std::process::id(),
+        nonce
+    ));
+
+    let result = (|| -> std::io::Result<Vec<String>> {
+        std::fs::create_dir_all(&temp_dir)?;
+        crate::onboard::wizard::scaffold_workspace(&temp_dir, ctx)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+        let targets = [
+            "IDENTITY.md",
+            "USER.md",
+            "AGENTS.md",
+            "SOUL.md",
+            "BOOTSTRAP.md",
+        ];
+        let mut updated = Vec::new();
+        for name in targets {
+            let src = temp_dir.join(name);
+            if !src.is_file() {
+                continue;
+            }
+            let bytes = std::fs::read(&src)?;
+            std::fs::write(workspace_dir.join(name), bytes)?;
+            updated.push(name.to_string());
+        }
+        Ok(updated)
+    })();
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    result
+}
+
+/// POST /api/onboard/scaffold — create the OpenClaw workspace files (like `zeroclaw onboard`).
+pub async fn handle_api_onboard_scaffold(
+    State(state): State<AppState>,
+    body: Result<Json<OnboardScaffoldReq>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        }
+    };
+
+    let config_guard = state.config.lock();
+    let workspace_dir = config_guard.workspace_dir.clone();
+    drop(config_guard);
+
+    let before: HashSet<String> = openclaw_scaffold_files()
+        .iter()
+        .filter(|f| workspace_dir.join(*f).is_file())
+        .map(|s| s.to_string())
+        .collect();
+
+    let ctx = crate::onboard::wizard::ProjectContext {
+        user_name: if req.user_name.trim().is_empty() {
+            "User".to_string()
+        } else {
+            req.user_name.trim().to_string()
+        },
+        timezone: if req.timezone.trim().is_empty() {
+            "UTC".to_string()
+        } else {
+            req.timezone.trim().to_string()
+        },
+        agent_name: if req.agent_name.trim().is_empty() {
+            "ZeroClaw".to_string()
+        } else {
+            req.agent_name.trim().to_string()
+        },
+        communication_style: if req.communication_style.trim().is_empty() {
+            "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing.".to_string()
+        } else {
+            req.communication_style.trim().to_string()
+        },
+        communication_language: if req.communication_language.trim().is_empty() {
+            "English".to_string()
+        } else {
+            req.communication_language.trim().to_string()
+        },
+    };
+
+    if let Err(e) = crate::onboard::wizard::scaffold_workspace(&workspace_dir, &ctx) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        );
+    }
+
+    let personalization_updated = if req.refresh_personalization {
+        match refresh_onboard_personalization_files(&workspace_dir, &ctx) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let after: HashSet<String> = openclaw_scaffold_files()
+        .iter()
+        .filter(|f| workspace_dir.join(*f).is_file())
+        .map(|s| s.to_string())
+        .collect();
+
+    let created: Vec<String> = after.difference(&before).cloned().collect();
+    let skipped: Vec<String> = before.intersection(&after).cloned().collect();
+
+    let mut marker_written = false;
+    if req.mark_done {
+        let marker_path = webui_onboard_marker_path(&workspace_dir);
+        if let Some(parent) = marker_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let marker = serde_json::json!({
+            "onboarded_at": now,
+            "version": env!("CARGO_PKG_VERSION"),
+        });
+        if std::fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap_or_default())
+            .is_ok()
+        {
+            marker_written = true;
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "created": created,
+            "skipped": skipped,
+            "marker_written": marker_written,
+            "personalization_updated": personalization_updated,
+            "workspace_dir": workspace_dir.to_string_lossy().to_string(),
+        })),
+    )
+}
+
+/// POST /api/onboard/mark-done — write a marker so the wizard won't auto-show again.
+pub async fn handle_api_onboard_mark_done(State(state): State<AppState>) -> impl IntoResponse {
+    let config = state.config.lock();
+    let marker_path = webui_onboard_marker_path(&config.workspace_dir);
+    if let Some(parent) = marker_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let marker = serde_json::json!({
+        "onboarded_at": now,
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+    if let Err(e) = std::fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap_or_default()) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        );
+    }
+    (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
 }

@@ -121,6 +121,7 @@ impl WhatsAppChannel {
                         id: Uuid::new_v4().to_string(),
                         reply_target: normalized_from.clone(),
                         sender: normalized_from,
+                        sender_name: None,
                         content,
                         channel: "whatsapp".to_string(),
                         timestamp,

@@ -255,6 +255,7 @@ impl SignalChannel {
         Some(ChannelMessage {
             id: format!("sig_{timestamp}"),
             sender: sender.clone(),
+            sender_name: None,
             reply_target: target,
             content: text.to_string(),
             channel: "signal".to_string(),

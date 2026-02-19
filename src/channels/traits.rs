@@ -5,6 +5,8 @@ use async_trait::async_trait;
 pub struct ChannelMessage {
     pub id: String,
     pub sender: String,
+    /// Optional human-readable sender display name (nickname / username).
+    pub sender_name: Option<String>,
     pub reply_target: String,
     pub content: String,
     pub channel: String,
@@ -95,6 +97,7 @@ mod tests {
             tx.send(ChannelMessage {
                 id: "1".into(),
                 sender: "tester".into(),
+                sender_name: None,
                 reply_target: "tester".into(),
                 content: "hello".into(),
                 channel: "dummy".into(),
@@ -110,6 +113,7 @@ mod tests {
         let message = ChannelMessage {
             id: "42".into(),
             sender: "alice".into(),
+            sender_name: Some("Alice".into()),
             reply_target: "alice".into(),
             content: "ping".into(),
             channel: "dummy".into(),
@@ -119,6 +123,7 @@ mod tests {
         let cloned = message.clone();
         assert_eq!(cloned.id, "42");
         assert_eq!(cloned.sender, "alice");
+        assert_eq!(cloned.sender_name.as_deref(), Some("Alice"));
         assert_eq!(cloned.reply_target, "alice");
         assert_eq!(cloned.content, "ping");
         assert_eq!(cloned.channel, "dummy");

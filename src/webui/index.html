@@ -26,6 +26,12 @@
     <span class="nav-label-expanded">对话</span>
   </button>
 
+  <button class="nav-item" onclick="switchTab('history')">
+    <span class="indicator"><span class="material-symbols-outlined">history</span></span>
+    <span class="nav-label">记录</span>
+    <span class="nav-label-expanded">聊天记录</span>
+  </button>
+
   <button class="nav-item" onclick="switchTab('channels')">
     <span class="indicator"><span class="material-symbols-outlined">hub</span></span>
     <span class="nav-label">平台</span>
@@ -206,6 +212,59 @@
     </div>
   </main>
 
+  <main id="page-history" class="page">
+    <div class="dashboard">
+      <div class="card">
+        <div class="card-header">
+          <div class="icon-circle"><span class="material-symbols-outlined">history</span></div>
+          <div class="header-main">
+            <span class="card-title">聊天记录</span>
+            <div class="card-subtitle">浏览消息平台的历史对话（需要启用记忆自动保存）</div>
+          </div>
+          <div class="header-actions">
+            <button class="btn btn-text" onclick="loadConversations()">刷新</button>
+          </div>
+        </div>
+
+        <div class="history-toolbar">
+          <div class="segmented" role="tablist" aria-label="会话类型">
+            <button class="seg active" id="history-kind-private" role="tab" onclick="setConversationKind('private')">私聊</button>
+            <button class="seg" id="history-kind-group" role="tab" onclick="setConversationKind('group')">群聊</button>
+            <button class="seg" id="history-kind-other" role="tab" onclick="setConversationKind('other')">其他</button>
+          </div>
+
+          <div class="history-settings">
+            <div class="form-group inline">
+              <label>上下文消息数</label>
+              <input class="form-input" type="number" id="history-context-limit" min="0" step="1" value="100">
+            </div>
+            <button class="btn btn-fill btn-sm" onclick="saveConversationContextLimit()">保存</button>
+          </div>
+
+          <div class="history-hint" id="history-hint"></div>
+        </div>
+
+        <div class="history-layout">
+          <div class="history-sessions" id="history-sessions">
+            <div class="empty-state compact">
+              <span class="material-symbols-outlined">hourglass_empty</span>
+              <p>正在加载会话…</p>
+            </div>
+          </div>
+
+          <div class="history-messages">
+            <div class="messages" id="history-messages">
+              <div class="empty-state" id="history-empty">
+                <span class="material-symbols-outlined">forum</span>
+                <p>选择左侧会话查看消息</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
   <main id="page-channels" class="page">
     <div class="dashboard">
       <div class="card">
@@ -378,7 +437,17 @@
           <span class="card-title">设置</span>
         </div>
         <div class="settings-content">
-          <p class="settings-tip">大部分配置请通过 <code>config.toml</code> 编辑，或使用 <code>zeroclaw onboard --interactive</code> 交互式向导。</p>
+          <p class="settings-tip">大部分配置可以在本 WebUI 中完成；也可直接编辑 <code>config.toml</code>（高级）。</p>
+
+          <div class="settings-service-box">
+            <div class="settings-service-title">首次使用引导</div>
+            <p class="settings-service-desc">第一次打开 WebUI 会自动出现。你也可以在这里随时重新运行（快速配置模型/渠道/生成工作区文件）。</p>
+            <div class="service-actions">
+              <button class="btn btn-fill" onclick="openOnboardWizard(true)">重新运行引导</button>
+              <button class="btn btn-text" onclick="openOnboardWizard(true, 'files')">仅生成/修复工作区文件</button>
+            </div>
+          </div>
+
           <div class="settings-service-box">
             <div class="settings-service-title">系统守护进程 (Daemon Service)</div>
             <p class="settings-service-desc">将 ZeroClaw 注册为开机自启的后台服务 (支持 systemd/launchd/schtasks)</p>
@@ -394,6 +463,328 @@
       </div>
     </div>
   </main>
+</div>
+
+<!-- ════════════════════════════════════════════════════════════════════════
+     First-run Onboarding Wizard (WebUI)
+     Shown automatically on first open; can be reopened from Settings.
+     ════════════════════════════════════════════════════════════════════════ -->
+<div class="onboard-overlay" id="onboard-overlay" aria-hidden="true">
+  <div class="onboard-panel" role="dialog" aria-modal="true" aria-labelledby="onboard-title">
+    <div class="onboard-header">
+      <div class="onboard-brand">
+        <span class="material-symbols-outlined onboard-brand-icon">smart_toy</span>
+        <div>
+          <div class="onboard-title" id="onboard-title">欢迎使用 ZeroClaw</div>
+          <div class="onboard-subtitle">首次引导会帮你快速完成配置（可随时跳过/重跑）</div>
+        </div>
+      </div>
+      <div class="onboard-header-actions">
+        <button class="btn btn-text" onclick="onboardSkip()">稍后再说</button>
+        <button class="btn btn-text" onclick="closeOnboardWizard()">关闭</button>
+      </div>
+    </div>
+
+    <div class="onboard-body">
+      <aside class="onboard-stepper">
+        <button type="button" class="onboard-step-btn" data-step="0" onclick="gotoOnboardStep(0)">1 · 工作区</button>
+        <button type="button" class="onboard-step-btn" data-step="1" onclick="gotoOnboardStep(1)">2 · 模型</button>
+        <button type="button" class="onboard-step-btn" data-step="2" onclick="gotoOnboardStep(2)">3 · 渠道</button>
+        <button type="button" class="onboard-step-btn" data-step="3" onclick="gotoOnboardStep(3)">4 · 内网穿透</button>
+        <button type="button" class="onboard-step-btn" data-step="4" onclick="gotoOnboardStep(4)">5 · 工具与安全</button>
+        <button type="button" class="onboard-step-btn" data-step="5" onclick="gotoOnboardStep(5)">6 · 硬件</button>
+        <button type="button" class="onboard-step-btn" data-step="6" onclick="gotoOnboardStep(6)">7 · 记忆</button>
+        <button type="button" class="onboard-step-btn" data-step="7" onclick="gotoOnboardStep(7)">8 · 个性化</button>
+        <button type="button" class="onboard-step-btn" data-step="8" onclick="gotoOnboardStep(8)">9 · 完成</button>
+      </aside>
+
+      <section class="onboard-content">
+        <div class="onboard-step" data-step="0">
+          <h2 class="onboard-h2">工作区检查</h2>
+          <p class="onboard-p">ZeroClaw 会把身份设定、记忆、会话等保存在“工作区”。首次启动建议自动生成基础目录与上下文文件（SOUL/IDENTITY/TOOLS…），避免提示词注入缺失。</p>
+          <div class="onboard-checklist" id="ob-workspace-checklist">加载中…</div>
+          <div class="inline-alert">提示：此引导只影响你的工作区与配置文件，不会上传任何数据。</div>
+        </div>
+
+        <div class="onboard-step" data-step="1">
+          <h2 class="onboard-h2">模型与 API Key</h2>
+          <div class="config-grid">
+            <div class="form-group">
+              <label>默认 Provider</label>
+              <select class="form-input" id="ob-provider" onchange="onboardProviderChanged()">
+                <option value="openrouter">OpenRouter</option>
+                <option value="anthropic">Anthropic</option>
+                <option value="openai">OpenAI</option>
+                <option value="gemini">Google Gemini</option>
+                <option value="ollama">Ollama</option>
+                <option value="glm">智谱 GLM / Z.AI</option>
+                <option value="minimax">MiniMax</option>
+                <option value="moonshot">Moonshot / Kimi</option>
+                <option value="qwen">通义千问 Qwen</option>
+                <option value="zai">Z.AI Coding</option>
+                <option value="compatible">自定义兼容 (Custom)</option>
+              </select>
+              <div class="field-hint">提示：自定义兼容会写入 <code>default_provider=custom:&lt;url&gt;</code></div>
+            </div>
+
+            <div class="form-group" id="ob-api-url-wrap" style="display:none">
+              <label>自定义 API Base URL</label>
+              <input class="form-input" id="ob-api-url" type="text" placeholder="例如: https://api.openai.com/v1">
+            </div>
+
+            <div class="form-group">
+              <label>默认模型 (Model)</label>
+              <input class="form-input" id="ob-model" type="text" placeholder="例如: gpt-4o-mini / claude-3-5-sonnet / llama3">
+              <div class="inline-field" style="margin-top:8px">
+                <button class="btn btn-text" id="ob-discover-btn" onclick="onboardDiscoverModels()">从接口自动拉取模型</button>
+                <select class="form-input" id="ob-discover-select" onchange="onboardApplyDiscoveredModel(this.value)">
+                  <option value="">选择已发现模型…</option>
+                </select>
+              </div>
+              <div class="field-hint" id="ob-discover-status"></div>
+            </div>
+
+            <div class="form-group">
+              <label>API Key / 鉴权令牌</label>
+              <input class="form-input" id="ob-api-key" type="password" placeholder="未配置">
+              <div class="field-hint">不输入则保留原值（如果已配置）。</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="onboard-step" data-step="2">
+          <h2 class="onboard-h2">消息渠道</h2>
+          <p class="onboard-p">选择你要用什么平台与 ZeroClaw 对话。你可以先只配一个（例如 NapCat / OneBot v11），以后再补充。</p>
+
+          <div class="onboard-channel">
+            <label class="checkbox-field"><input type="checkbox" id="ob-ch-onebot" onchange="onboardToggleChannel('onebot')"> <span>启用 NapCat / OneBot v11</span></label>
+            <div class="onboard-channel-body" id="ob-ch-onebot-body">
+              <div class="config-grid">
+                <div class="form-group"><label>OneBot API 地址</label><input class="form-input" id="ob-onebot-api-url" type="text" placeholder="http://127.0.0.1:3000"></div>
+                <div class="form-group"><label>Access Token (可选)</label><input class="form-input" id="ob-onebot-token" type="password" placeholder="不输入则为空"></div>
+                <div class="form-group"><label>回调监听地址</label><input class="form-input" id="ob-onebot-listen-host" type="text" placeholder="0.0.0.0"></div>
+                <div class="form-group"><label>回调监听端口</label><input class="form-input" id="ob-onebot-listen-port" type="number" placeholder="8096"></div>
+                <div class="form-group"><label>授权 QQ（逗号分隔；* = 允许全部；留空 = 拒绝全部）</label><input class="form-input" id="ob-onebot-allowed-users" type="text" placeholder="例如: 12345, 67890 或 *"></div>
+                <div class="form-group"><label>授权群号（逗号分隔；留空 = 允许全部）</label><input class="form-input" id="ob-onebot-allowed-groups" type="text" placeholder="例如: 98765 或留空"></div>
+                <label class="checkbox-field"><input type="checkbox" id="ob-onebot-require-at"> <span>群聊仅响应 @ 机器人</span></label>
+              </div>
+            </div>
+          </div>
+
+          <div class="onboard-channel">
+            <label class="checkbox-field"><input type="checkbox" id="ob-ch-telegram" onchange="onboardToggleChannel('telegram')"> <span>启用 Telegram</span></label>
+            <div class="onboard-channel-body" id="ob-ch-telegram-body">
+              <div class="config-grid">
+                <div class="form-group"><label>Bot Token</label><input class="form-input" id="ob-telegram-token" type="password" placeholder="123:ABC..."></div>
+                <div class="form-group"><label>授权用户 ID（逗号分隔；* = 允许全部；留空 = 默认更安全）</label><input class="form-input" id="ob-telegram-allowed" type="text" placeholder="12345678"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="onboard-channel">
+            <label class="checkbox-field"><input type="checkbox" id="ob-ch-discord" onchange="onboardToggleChannel('discord')"> <span>启用 Discord</span></label>
+            <div class="onboard-channel-body" id="ob-ch-discord-body">
+              <div class="config-grid">
+                <div class="form-group"><label>Bot Token</label><input class="form-input" id="ob-discord-token" type="password"></div>
+                <div class="form-group"><label>Guild ID（可选）</label><input class="form-input" id="ob-discord-guild" type="text"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="onboard-channel">
+            <label class="checkbox-field"><input type="checkbox" id="ob-ch-webhook" onchange="onboardToggleChannel('webhook')"> <span>启用 Webhook</span></label>
+            <div class="onboard-channel-body" id="ob-ch-webhook-body">
+              <div class="config-grid">
+                <div class="form-group"><label>监听端口</label><input class="form-input" id="ob-webhook-port" type="number" placeholder="8080"></div>
+                <div class="form-group"><label>密钥（可选）</label><input class="form-input" id="ob-webhook-secret" type="password"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="inline-alert">更多渠道（Slack/飞书/钉钉/QQ 官方等）可在「消息平台」页继续配置。</div>
+        </div>
+
+        <div class="onboard-step" data-step="3">
+          <h2 class="onboard-h2">内网穿透 (可选)</h2>
+          <p class="onboard-p">如果你想从外网访问 ZeroClaw，可以配置 Tunnel。默认 <code>none</code> 不开启。</p>
+          <div class="config-grid">
+            <div class="form-group">
+              <label>Tunnel Provider</label>
+              <select class="form-input" id="ob-tunnel-provider" onchange="onboardTunnelChanged()">
+                <option value="none">none（不启用）</option>
+                <option value="cloudflare">cloudflare</option>
+                <option value="tailscale">tailscale</option>
+                <option value="ngrok">ngrok</option>
+                <option value="custom">custom</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="onboard-tunnel-box" id="ob-tunnel-cloudflare" style="display:none">
+            <div class="form-group"><label>Cloudflare Tunnel Token</label><input class="form-input" id="ob-tunnel-cf-token" type="password"></div>
+          </div>
+          <div class="onboard-tunnel-box" id="ob-tunnel-tailscale" style="display:none">
+            <label class="checkbox-field"><input type="checkbox" id="ob-tunnel-ts-funnel"> <span>启用 Funnel（公网）</span></label>
+            <div class="form-group" style="margin-top:10px"><label>Hostname（可选）</label><input class="form-input" id="ob-tunnel-ts-host" type="text"></div>
+          </div>
+          <div class="onboard-tunnel-box" id="ob-tunnel-ngrok" style="display:none">
+            <div class="config-grid">
+              <div class="form-group"><label>Ngrok Auth Token</label><input class="form-input" id="ob-tunnel-ngrok-token" type="password"></div>
+              <div class="form-group"><label>Domain（可选）</label><input class="form-input" id="ob-tunnel-ngrok-domain" type="text"></div>
+            </div>
+          </div>
+          <div class="onboard-tunnel-box" id="ob-tunnel-custom" style="display:none">
+            <div class="form-group"><label>Start Command（使用 {port}/{host} 占位符）</label><input class="form-input" id="ob-tunnel-custom-cmd" type="text" placeholder="bore local {port} --to bore.pub"></div>
+            <div class="config-grid" style="margin-top:8px">
+              <div class="form-group"><label>Health URL（可选）</label><input class="form-input" id="ob-tunnel-custom-health" type="text"></div>
+              <div class="form-group"><label>URL Pattern（可选）</label><input class="form-input" id="ob-tunnel-custom-pattern" type="text" placeholder="https?://..."> </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="onboard-step" data-step="4">
+          <h2 class="onboard-h2">工具模式与安全 (可选)</h2>
+          <p class="onboard-p">建议保持默认（Supervised + 加密 secrets）。高级配置可稍后在「更多配置」中调整。</p>
+          <div class="config-grid">
+            <div class="form-group">
+              <label>自主权等级 (autonomy.level)</label>
+              <select class="form-input" id="ob-autonomy-level">
+                <option value="readonly">readonly</option>
+                <option value="supervised">supervised（推荐）</option>
+                <option value="full">full</option>
+              </select>
+            </div>
+            <label class="checkbox-field"><input type="checkbox" id="ob-secrets-encrypt"> <span>启用 secrets.encrypt（加密保存密钥）</span></label>
+            <label class="checkbox-field"><input type="checkbox" id="ob-composio-enabled" onchange="onboardComposioChanged()"> <span>启用 Composio（OAuth 管理工具面）</span></label>
+          </div>
+          <div id="ob-composio-box" style="display:none;margin-top:12px">
+            <div class="config-grid">
+              <div class="form-group"><label>Composio API Key</label><input class="form-input" id="ob-composio-api-key" type="password"></div>
+              <div class="form-group"><label>Entity ID</label><input class="form-input" id="ob-composio-entity" type="text" placeholder="default"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="onboard-step" data-step="5">
+          <h2 class="onboard-h2">硬件 (可选)</h2>
+          <p class="onboard-p">如果你需要让 ZeroClaw 操作硬件（串口/探针），可在此启用。通常保持关闭即可。</p>
+          <div class="config-grid">
+            <label class="checkbox-field"><input type="checkbox" id="ob-hw-enabled" onchange="onboardHardwareChanged()"> <span>启用硬件支持</span></label>
+            <div class="form-group">
+              <label>Transport</label>
+              <select class="form-input" id="ob-hw-transport" onchange="onboardHardwareChanged()">
+                <option value="None">none</option>
+                <option value="Native">native</option>
+                <option value="Serial">serial</option>
+                <option value="Probe">probe</option>
+              </select>
+            </div>
+          </div>
+          <div id="ob-hw-serial" style="display:none;margin-top:12px">
+            <div class="config-grid">
+              <div class="form-group"><label>Serial Port</label><input class="form-input" id="ob-hw-serial-port" type="text" placeholder="COM3 或 /dev/ttyUSB0"></div>
+              <div class="form-group"><label>Baud Rate</label><input class="form-input" id="ob-hw-baud" type="number" placeholder="115200"></div>
+            </div>
+          </div>
+          <div id="ob-hw-probe" style="display:none;margin-top:12px">
+            <div class="form-group"><label>Probe Target (例如 STM32F401RE)</label><input class="form-input" id="ob-hw-probe-target" type="text"></div>
+          </div>
+          <label class="checkbox-field" style="margin-top:10px"><input type="checkbox" id="ob-hw-datasheets"> <span>启用 workspace_datasheets（PDF 资料 RAG）</span></label>
+        </div>
+
+        <div class="onboard-step" data-step="6">
+          <h2 class="onboard-h2">记忆系统</h2>
+          <p class="onboard-p">默认建议使用 <code>sqlite</code>，并开启自动保存。</p>
+          <div class="config-grid">
+            <div class="form-group">
+              <label>Memory Backend</label>
+              <select class="form-input" id="ob-mem-backend">
+                <option value="sqlite">sqlite（推荐）</option>
+                <option value="markdown">markdown</option>
+                <option value="none">none</option>
+              </select>
+            </div>
+            <label class="checkbox-field"><input type="checkbox" id="ob-mem-autosave"> <span>自动保存 (memory.auto_save)</span></label>
+            <div class="form-group">
+              <label>对话保留天数 (conversation_retention_days)</label>
+              <input class="form-input" id="ob-mem-retention" type="number" placeholder="30">
+            </div>
+            <div class="form-group">
+              <label>每次注入的历史条数 (agent.max_history_messages)</label>
+              <input class="form-input" id="ob-agent-max-history" type="number" placeholder="100">
+            </div>
+          </div>
+        </div>
+
+        <div class="onboard-step" data-step="7">
+          <h2 class="onboard-h2">项目上下文（个性化）</h2>
+          <p class="onboard-p">这些信息会写入工作区的 <code>SOUL.md</code>/<code>USER.md</code>/<code>IDENTITY.md</code> 等文件，作为系统提示词的一部分。</p>
+          <div class="config-grid">
+            <div class="form-group"><label>你的称呼</label><input class="form-input" id="ob-user-name" type="text" placeholder="User"></div>
+            <div class="form-group"><label>你的时区</label><input class="form-input" id="ob-timezone" type="text" placeholder="Asia/Shanghai"></div>
+            <div class="form-group"><label>Agent 名称</label><input class="form-input" id="ob-agent-name" type="text" placeholder="ZeroClaw"></div>
+            <div class="form-group">
+              <label>默认沟通语言</label>
+              <select class="form-input" id="ob-comm-language" onchange="onboardLanguageChanged()">
+                <option value="中文（简体）">中文（简体）</option>
+                <option value="中文（繁體）">中文（繁體）</option>
+                <option value="English">English</option>
+                <option value="日本語">日本語</option>
+                <option value="한국어">한국어</option>
+                <option value="Español">Español</option>
+                <option value="Français">Français</option>
+                <option value="Deutsch">Deutsch</option>
+                <option value="custom">自定义…</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>沟通风格</label>
+              <select class="form-input" id="ob-style-preset" onchange="onboardStylePresetChanged()">
+                <option value="direct">Direct & concise（直奔主题）</option>
+                <option value="friendly">Friendly & casual（友好自然）</option>
+                <option value="professional">Professional & polished（专业稳重）</option>
+                <option value="playful">Expressive & playful（活泼有趣）</option>
+                <option value="technical">Technical & detailed（技术细节）</option>
+                <option value="balanced">Balanced（自适应）</option>
+                <option value="custom">Custom（自定义）</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group" id="ob-lang-custom-wrap" style="display:none;margin-top:12px">
+            <label>自定义沟通语言</label>
+            <input class="form-input" id="ob-lang-custom" type="text" placeholder="例如：简体中文 / English / 日本語">
+          </div>
+          <div class="form-group" id="ob-style-custom-wrap" style="display:none;margin-top:12px">
+            <label>自定义沟通风格</label>
+            <textarea class="form-input" id="ob-style-custom" style="height:120px;resize:vertical" placeholder="写下你希望 AI 如何说话…"></textarea>
+          </div>
+        </div>
+
+        <div class="onboard-step" data-step="8">
+          <h2 class="onboard-h2">完成与应用</h2>
+          <p class="onboard-p">最后一步：保存配置，并（可选）一键生成工作区文件结构。</p>
+
+          <label class="checkbox-field"><input type="checkbox" id="ob-scaffold-files"> <span>生成/修复工作区上下文文件（推荐）</span></label>
+          <div class="inline-field" style="margin-top:12px">
+            <button class="btn btn-text" onclick="onboardCreateWorkspaceFiles()">立即生成工作区文件</button>
+            <button class="btn btn-text" onclick="switchTab('context-files'); closeOnboardWizard();">查看上下文文件页</button>
+          </div>
+          <div class="onboard-result" id="ob-finish-result"></div>
+          <div class="inline-alert">注意：部分配置（尤其是渠道/模型）保存后需要重启 ZeroClaw 进程才能完全生效。</div>
+        </div>
+      </section>
+    </div>
+
+    <div class="onboard-footer">
+      <div class="onboard-footer-left">
+        <span class="field-hint" id="ob-footer-hint"></span>
+      </div>
+      <div class="onboard-actions">
+        <button class="btn btn-text" id="ob-btn-prev" onclick="onboardPrev()">上一步</button>
+        <button class="btn btn-fill" id="ob-btn-next" onclick="onboardNext()">下一步</button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script src="/app.js"></script>

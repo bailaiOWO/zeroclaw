@@ -486,6 +486,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/app.js", get(crate::webui::handle_app))
         .route("/api/status", get(crate::webui::handle_api_status))
         .route("/api/chat", post(crate::webui::handle_api_chat))
+        .route(
+            "/api/conversations",
+            get(crate::webui::handle_api_conversations_list),
+        )
+        .route(
+            "/api/conversations/messages",
+            get(crate::webui::handle_api_conversations_messages),
+        )
         .route("/api/config", get(crate::webui::handle_api_config))
         .route("/api/config", post(crate::webui::handle_api_config_mutate))
         .route(
@@ -495,6 +503,18 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route(
             "/api/config/raw",
             post(crate::webui::handle_api_config_raw_post),
+        )
+        .route(
+            "/api/onboard/status",
+            get(crate::webui::handle_api_onboard_status),
+        )
+        .route(
+            "/api/onboard/scaffold",
+            post(crate::webui::handle_api_onboard_scaffold),
+        )
+        .route(
+            "/api/onboard/mark-done",
+            post(crate::webui::handle_api_onboard_mark_done),
         )
         .route("/api/identity", get(crate::webui::handle_api_identity_get))
         .route(
@@ -1057,8 +1077,9 @@ mod tests {
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 100)),
             whatsapp: None,
             whatsapp_app_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
@@ -1097,8 +1118,9 @@ mod tests {
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 100)),
             whatsapp: None,
             whatsapp_app_secret: None,
             observer,
@@ -1289,6 +1311,7 @@ mod tests {
         let msg = ChannelMessage {
             id: "wamid-123".into(),
             sender: "+1234567890".into(),
+            sender_name: None,
             reply_target: "+1234567890".into(),
             content: "hello".into(),
             channel: "whatsapp".into(),

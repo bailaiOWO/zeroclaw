@@ -30,6 +30,7 @@ pub struct ProjectContext {
     pub user_name: String,
     pub timezone: String,
     pub agent_name: String,
+    pub communication_language: String,
     pub communication_style: String,
 }
 
@@ -367,6 +368,7 @@ pub fn run_quick_setup(
         user_name: std::env::var("USER").unwrap_or_else(|_| "User".into()),
         timezone: "UTC".into(),
         agent_name: "ZeroClaw".into(),
+        communication_language: "English".into(),
         communication_style:
             "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing."
                 .into(),
@@ -2350,6 +2352,31 @@ fn setup_project_context() -> Result<ProjectContext> {
         .default("ZeroClaw".into())
         .interact_text()?;
 
+    let language_options = vec![
+        "中文（简体）",
+        "中文（繁體）",
+        "English",
+        "日本語",
+        "한국어",
+        "Español",
+        "Français",
+        "Deutsch",
+        "Other (type manually)",
+    ];
+    let language_idx = Select::new()
+        .with_prompt("  Default communication language")
+        .items(&language_options)
+        .default(2)
+        .interact()?;
+    let communication_language = if language_idx == language_options.len() - 1 {
+        Input::new()
+            .with_prompt("  Enter language")
+            .default("English".into())
+            .interact_text()?
+    } else {
+        language_options[language_idx].to_string()
+    };
+
     let style_options = vec![
         "Direct & concise — skip pleasantries, get to the point",
         "Friendly & casual — warm, human, and helpful",
@@ -2382,11 +2409,12 @@ fn setup_project_context() -> Result<ProjectContext> {
     };
 
     println!(
-        "  {} Context: {} | {} | {} | {}",
+        "  {} Context: {} | {} | {} | {} | {}",
         style("✓").green().bold(),
         style(&user_name).green(),
         style(&timezone).green(),
         style(&agent_name).green(),
+        style(&communication_language).green(),
         style(&communication_style).green().dim()
     );
 
@@ -2394,6 +2422,7 @@ fn setup_project_context() -> Result<ProjectContext> {
         user_name,
         timezone,
         agent_name,
+        communication_language,
         communication_style,
     })
 }
@@ -3725,7 +3754,7 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
 // ── Step 6: Scaffold workspace files ─────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> {
+pub(crate) fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> {
     let agent = if ctx.agent_name.is_empty() {
         "ZeroClaw"
     } else {
@@ -3746,6 +3775,11 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
     } else {
         &ctx.communication_style
     };
+    let comm_lang = if ctx.communication_language.is_empty() {
+        "English"
+    } else {
+        &ctx.communication_language
+    };
 
     let identity = format!(
         "# IDENTITY.md — Who Am I?\n\n\
@@ -3764,7 +3798,8 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
          1. Read `SOUL.md` — this is who you are\n\
          2. Read `USER.md` — this is who you're helping\n\
          3. Use `memory_recall` for recent context (daily notes are on-demand)\n\
-         4. If in MAIN SESSION (direct chat): `MEMORY.md` is already injected\n\n\
+         4. If in MAIN SESSION (direct chat): `MEMORY.md` is already injected\n\
+         5. Default reply language: {comm_lang} (switch only when user asks)\n\n\
          Don't ask permission. Just do it.\n\n\
          ## Memory System\n\n\
          You wake up fresh each session. These files ARE your continuity:\n\n\
@@ -3836,6 +3871,7 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
          - Always introduce yourself as {agent} if asked\n\n\
          ## Communication\n\n\
          {comm_style}\n\n\
+         - Default language: {comm_lang}. Switch only if the user requests another language.\n\
          - Sound like a real person, not a support script.\n\
          - Mirror the user's energy: calm when serious, upbeat when casual.\n\
          - Use emojis naturally (0-2 max when they help tone, not every sentence).\n\
@@ -3858,7 +3894,7 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
          ## About You\n\
          - **Name:** {user}\n\
          - **Timezone:** {tz}\n\
-         - **Languages:** English\n\n\
+         - **Preferred language:** {comm_lang}\n\n\
          ## Communication Style\n\
          - {comm_style}\n\n\
          ## Preferences\n\
@@ -3906,6 +3942,7 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
          *You just woke up. Time to figure out who you are.*\n\n\
          Your human's name is **{user}** (timezone: {tz}).\n\
          They prefer: {comm_style}\n\n\
+         Start in: {comm_lang}.\n\n\
          ## First Conversation\n\n\
          Don't interrogate. Don't be robotic. Just... talk.\n\
          Introduce yourself as {agent} and get to know each other.\n\n\
@@ -4285,6 +4322,7 @@ mod tests {
         assert!(ctx.user_name.is_empty());
         assert!(ctx.timezone.is_empty());
         assert!(ctx.agent_name.is_empty());
+        assert!(ctx.communication_language.is_empty());
         assert!(ctx.communication_style.is_empty());
     }
 
@@ -4436,6 +4474,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scaffold_bakes_communication_language() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = ProjectContext {
+            communication_language: "简体中文".into(),
+            ..Default::default()
+        };
+        scaffold_workspace(tmp.path(), &ctx).unwrap();
+
+        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        assert!(user_md.contains("**Preferred language:** 简体中文"));
+
+        let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        assert!(soul.contains("Default language: 简体中文"));
+    }
+
     // ── scaffold_workspace: defaults when context is empty ──────
 
     #[test]
@@ -4458,6 +4512,10 @@ mod tests {
         assert!(
             user_md.contains("**Timezone:** UTC"),
             "should default timezone to UTC"
+        );
+        assert!(
+            user_md.contains("**Preferred language:** English"),
+            "should default communication language to English"
         );
 
         let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
@@ -4639,6 +4697,7 @@ mod tests {
             user_name: "José María".into(),
             agent_name: "ZeroClaw-v2".into(),
             timezone: "Europe/Madrid".into(),
+            communication_language: "Español".into(),
             communication_style: "Be direct.".into(),
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
@@ -4659,6 +4718,7 @@ mod tests {
             user_name: "Argenis".into(),
             timezone: "US/Eastern".into(),
             agent_name: "Claw".into(),
+            communication_language: "English".into(),
             communication_style:
                 "Be friendly, human, and conversational. Show warmth and empathy while staying efficient. Use natural contractions."
                     .into(),

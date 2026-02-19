@@ -581,6 +581,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Some(ChannelMessage {
             id: format!("telegram_{chat_id}_{message_id}"),
             sender: sender_identity,
+            sender_name: if username == "unknown" {
+                None
+            } else {
+                Some(username)
+            },
             reply_target,
             content: text.to_string(),
             channel: "telegram".to_string(),

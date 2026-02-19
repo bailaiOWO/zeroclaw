@@ -1,5 +1,5 @@
 const pageTitles = {
-  dashboard:'仪表盘', chat:'对话', channels:'消息平台',
+  dashboard:'仪表盘', chat:'对话', history:'聊天记录', channels:'消息平台',
   providers:'模型与路由', config:'更多配置', settings:'设置', 
   identity:'身份设定', cron:'定时任务',
   'context-files':'上下文文件'
@@ -26,6 +26,7 @@ function switchTab(name){
   if(['channels','providers','config'].includes(name)) loadConfig();
   if(name==='identity') loadIdentity();
   if(name==='cron') loadCron();
+  if(name==='history') loadConversations();
   if(name==='context-files'){
     loadContextFiles();
     if(contextAutoRefreshEnabled) startContextAutoRefresh();
@@ -37,8 +38,167 @@ function refreshCurrent(){
   if(['channels','providers','config'].includes(currentTab)) loadConfig();
   if(currentTab==='identity') loadIdentity();
   if(currentTab==='cron') loadCron();
+  if(currentTab==='history') loadConversations();
   if(currentTab==='context-files') loadContextFiles();
 }
+
+// ── Conversation history ─────────────────────────────────────────────────────
+let _conversationKind = 'private';
+let _selectedConversationSession = '';
+
+function fmtLocalTimeFromUnix(ts){
+  if(!ts) return '';
+  try{ return new Date(ts*1000).toLocaleString(); }catch(e){ return String(ts); }
+}
+
+function formatConversationTarget(kind, target){
+  const t = (target||'').trim();
+  if(!t) return '';
+  if(kind==='group' && t.startsWith('group:')) return '群聊 · '+t.slice('group:'.length);
+  if(kind==='private' && (t.startsWith('private:')||t.startsWith('user:'))){
+    const v = t.replace(/^private:/,'').replace(/^user:/,'');
+    return '私聊 · '+v;
+  }
+  return t;
+}
+
+async function loadConversationSettings(){
+  try{
+    const r = await fetch('/api/config');
+    if(!r.ok) return;
+    const d = await r.json().catch(()=>({}));
+    const limit = d?.agent?.max_history_messages;
+    const inp = document.getElementById('history-context-limit');
+    if(inp && typeof limit === 'number') inp.value = String(limit);
+    const hint = document.getElementById('history-hint');
+    if(hint && typeof limit === 'number'){
+      hint.textContent = `当前配置：每次对话将携带最近 ${limit} 条历史消息（保存后通常需要重启 daemon/channels 才会生效）。`;
+    }
+  }catch(e){}
+}
+
+window.setConversationKind = function(kind){
+  _conversationKind = kind || 'private';
+  ['private','group','other'].forEach(k=>{
+    const btn = document.getElementById('history-kind-'+k);
+    if(btn) btn.classList.toggle('active', _conversationKind===k);
+  });
+  _selectedConversationSession = '';
+  const msgs = document.getElementById('history-messages');
+  if(msgs){
+    msgs.innerHTML = '<div class="empty-state" id="history-empty"><span class="material-symbols-outlined">forum</span><p>选择左侧会话查看消息</p></div>';
+  }
+  loadConversations();
+};
+
+window.loadConversations = async function(){
+  await loadConversationSettings();
+  const box = document.getElementById('history-sessions');
+  if(!box) return;
+  box.innerHTML = '<div class="empty-state compact"><span class="material-symbols-outlined">hourglass_empty</span><p>正在加载会话…</p></div>';
+
+  try{
+    let url = '/api/conversations?limit=200';
+    if(_conversationKind==='group' || _conversationKind==='private'){
+      url += `&channel=onebot_v11&kind=${encodeURIComponent(_conversationKind)}`;
+    } else {
+      url += `&kind=${encodeURIComponent(_conversationKind)}`;
+    }
+    const r = await fetch(url);
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(d.error||'加载失败');
+    const sessions = Array.isArray(d.sessions) ? d.sessions : [];
+
+    if(!sessions.length){
+      box.innerHTML = '<div class="empty-state compact"><span class="material-symbols-outlined">inbox</span><p>暂无会话</p></div>';
+      return;
+    }
+
+    box.innerHTML = '';
+    for(const s of sessions){
+      const item = document.createElement('div');
+      item.className = 'history-session-item'+(s.session_id===_selectedConversationSession?' active':'');
+      const title = formatConversationTarget(s.kind, s.target) || s.session_id;
+      const sub = `${s.channel||''} · ${s.last_timestamp||''}`.trim();
+      item.innerHTML = `<div class="history-session-title">${esc(title)}</div><div class="history-session-sub">${esc(sub)}</div>`;
+      item.onclick = ()=> selectConversation(s.session_id);
+      box.appendChild(item);
+    }
+  }catch(e){
+    box.innerHTML = '<div class="empty-state compact"><span class="material-symbols-outlined">error</span><p>'+esc(e.message||'加载失败')+'</p></div>';
+  }
+};
+
+async function selectConversation(sessionId){
+  _selectedConversationSession = sessionId;
+  // refresh highlight
+  document.querySelectorAll('#history-sessions .history-session-item').forEach(el=>el.classList.remove('active'));
+  // reload sessions list quickly to set active state (cheap DOM update would be better but simple)
+  loadConversations();
+  await loadConversationMessages(sessionId);
+}
+
+async function loadConversationMessages(sessionId){
+  const box = document.getElementById('history-messages');
+  if(!box) return;
+  box.innerHTML = '<div class="empty-state"><span class="material-symbols-outlined">hourglass_empty</span><p>正在加载消息…</p></div>';
+
+  try{
+    const url = `/api/conversations/messages?session_id=${encodeURIComponent(sessionId)}&limit=2000`;
+    const r = await fetch(url);
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(d.error||'加载失败');
+    const msgs = Array.isArray(d.messages) ? d.messages : [];
+    if(!msgs.length){
+      box.innerHTML = '<div class="empty-state"><span class="material-symbols-outlined">inbox</span><p>该会话暂无消息</p></div>';
+      return;
+    }
+
+    box.innerHTML = '';
+    for(const m of msgs){
+      const role = (m.role||'user').toLowerCase();
+      const div = document.createElement('div');
+      div.className = 'message ' + (role==='assistant'?'assistant':'user');
+      let meta = '';
+      if(role==='assistant'){
+        meta = '机器人';
+      } else {
+        const name = (m.sender_name||'').trim();
+        const id = (m.sender_id||'').trim();
+        if(name && id) meta = `${name}(${id})`;
+        else if(name) meta = name;
+        else if(id) meta = id;
+        else meta = '用户';
+      }
+      const ts = fmtLocalTimeFromUnix(m.timestamp);
+      if(ts) meta += ' · ' + ts;
+      div.innerHTML = `<div class="msg-meta">${esc(meta)}</div><div class="msg-text">${esc(m.text||'')}</div>`;
+      box.appendChild(div);
+    }
+    box.scrollTop = box.scrollHeight;
+  }catch(e){
+    box.innerHTML = '<div class="empty-state"><span class="material-symbols-outlined">error</span><p>'+esc(e.message||'加载失败')+'</p></div>';
+  }
+}
+
+window.saveConversationContextLimit = async function(){
+  const inp = document.getElementById('history-context-limit');
+  if(!inp) return;
+  const v = Number(inp.value||0);
+  if(!Number.isFinite(v) || v<0){
+    alert('请输入合法的数字');
+    return;
+  }
+  try{
+    const r = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'Agent',payload:{max_history_messages:Math.floor(v)}})});
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(d.error||'保存失败');
+    alert('已保存（通常需要重启 daemon/channels 才会生效）');
+    loadConversationSettings();
+  }catch(e){
+    alert('保存失败: '+(e.message||e));
+  }
+};
 
 function fmtUptime(s){
   if(s==null) return '—';
@@ -839,4 +999,696 @@ window.sendMessage = async function(){
   }
 };
 
+// ── First-run Onboarding Wizard (WebUI) ─────────────────────────────────────
+
+let _onboardOpen = false;
+let _onboardStep = 0;
+let _onboardMode = 'full'; // 'full' | 'files'
+let _onboardStatus = null;
+
+function onboardOverlayEl(){ return document.getElementById('onboard-overlay'); }
+function onboardIsActive(){ return onboardOverlayEl()?.classList.contains('active'); }
+
+function setOnboardOverlay(active){
+  const el = onboardOverlayEl();
+  if(!el) return;
+  el.classList.toggle('active', !!active);
+  el.setAttribute('aria-hidden', active ? 'false' : 'true');
+  document.body.style.overflow = active ? 'hidden' : '';
+}
+
+async function fetchOnboardStatus(){
+  try{
+    const r = await fetch('/api/onboard/status');
+    if(!r.ok) return null;
+    return await r.json();
+  }catch(e){
+    return null;
+  }
+}
+
+function renderOnboardChecklist(){
+  const box = document.getElementById('ob-workspace-checklist');
+  if(!box) return;
+  const ws = _onboardStatus?.workspace || {};
+  const presentFiles = new Set(ws.present_files||[]);
+  const missingFiles = new Set(ws.missing_files||[]);
+  const presentDirs = new Set(ws.present_subdirs||[]);
+  const missingDirs = new Set(ws.missing_subdirs||[]);
+
+  function item(name, ok){
+    return `\
+      <div class="onboard-check-item">\
+        <div class="onboard-check-left">\
+          <span class="material-symbols-outlined">${ok?'check_circle':'error'}</span>\
+          <span class="onboard-check-name">${esc(name)}</span>\
+        </div>\
+        <span class="onboard-check-badge ${ok?'ok':'miss'}">${ok?'已存在':'缺失'}</span>\
+      </div>`;
+  }
+
+  let html = '';
+  html += '<div class="section-title"><span class="material-symbols-outlined">folder</span>目录</div>';
+  const dirs = [...presentDirs, ...missingDirs].sort();
+  for(const d of dirs){
+    html += item(d+'/', presentDirs.has(d));
+  }
+
+  html += '<div class="section-title" style="margin-top:10px"><span class="material-symbols-outlined">description</span>上下文文件</div>';
+  const files = [...presentFiles, ...missingFiles].sort();
+  for(const f of files){
+    html += item(f, presentFiles.has(f));
+  }
+
+  box.innerHTML = html || '—';
+
+  // default scaffold checkbox
+  const sc = document.getElementById('ob-scaffold-files');
+  const hasWorkspaceReport =
+    Array.isArray(ws.present_files) || Array.isArray(ws.missing_files) ||
+    Array.isArray(ws.present_subdirs) || Array.isArray(ws.missing_subdirs);
+  if(sc && (!hasWorkspaceReport || missingFiles.size || missingDirs.size)){
+    sc.checked = true;
+  }
+}
+
+function fillOnboardFormsFromConfig(){
+  if(!_rawConfig) return;
+  const providerSel = document.getElementById('ob-provider');
+  const modelInp = document.getElementById('ob-model');
+  const apiKeyInp = document.getElementById('ob-api-key');
+  const apiUrlInp = document.getElementById('ob-api-url');
+
+  const rawProvider = (_rawConfig.default_provider||'').trim();
+  const isCustom = rawProvider.startsWith('custom:');
+  const providerId = isCustom ? 'compatible' : (stripCustom(rawProvider).toLowerCase()||'openrouter');
+  if(providerSel){
+    // If provider not in options, keep existing as compatible.
+    const opt = providerSel.querySelector(`option[value="${providerId}"]`);
+    providerSel.value = opt ? providerId : (isCustom?'compatible':'openrouter');
+  }
+  if(apiUrlInp){
+    apiUrlInp.value = isCustom ? stripCustom(rawProvider) : (_rawConfig.api_url||'');
+  }
+  if(modelInp) modelInp.value = _rawConfig.default_model || '';
+  if(apiKeyInp){
+    apiKeyInp.value = '';
+    apiKeyInp.placeholder = _rawConfig.api_key ? '•••••••• (已配置)' : '未配置';
+  }
+
+  // Channels
+  const ch = _rawConfig.channels_config || {};
+
+  const onebotOn = !!ch.onebot_v11;
+  const onebotCk = document.getElementById('ob-ch-onebot');
+  if(onebotCk) onebotCk.checked = onebotOn;
+  if(onebotOn){
+    document.getElementById('ob-onebot-api-url').value = ch.onebot_v11.api_url || '';
+    document.getElementById('ob-onebot-token').value = '';
+    document.getElementById('ob-onebot-token').placeholder = ch.onebot_v11.access_token ? '•••••••• (已配置)' : '不输入则为空';
+    document.getElementById('ob-onebot-listen-host').value = ch.onebot_v11.listen_host || '';
+    document.getElementById('ob-onebot-listen-port').value = ch.onebot_v11.listen_port ?? 8096;
+    document.getElementById('ob-onebot-allowed-users').value = arr2str(ch.onebot_v11.allowed_users||[]);
+    document.getElementById('ob-onebot-allowed-groups').value = arr2str(ch.onebot_v11.allowed_groups||[]);
+    document.getElementById('ob-onebot-require-at').checked = !!ch.onebot_v11.require_at_in_group;
+  }
+
+  const tgOn = !!ch.telegram;
+  const tgCk = document.getElementById('ob-ch-telegram');
+  if(tgCk) tgCk.checked = tgOn;
+  if(tgOn){
+    document.getElementById('ob-telegram-token').value = '';
+    document.getElementById('ob-telegram-token').placeholder = ch.telegram.bot_token ? '•••••••• (已配置)' : '123:ABC...';
+    document.getElementById('ob-telegram-allowed').value = arr2str(ch.telegram.allowed_users||[]);
+  }
+
+  const dsOn = !!ch.discord;
+  const dsCk = document.getElementById('ob-ch-discord');
+  if(dsCk) dsCk.checked = dsOn;
+  if(dsOn){
+    document.getElementById('ob-discord-token').value = '';
+    document.getElementById('ob-discord-token').placeholder = ch.discord.bot_token ? '•••••••• (已配置)' : '';
+    document.getElementById('ob-discord-guild').value = ch.discord.guild_id || '';
+  }
+
+  const whOn = !!ch.webhook;
+  const whCk = document.getElementById('ob-ch-webhook');
+  if(whCk) whCk.checked = whOn;
+  if(whOn){
+    document.getElementById('ob-webhook-port').value = ch.webhook.port ?? 8080;
+    document.getElementById('ob-webhook-secret').value = '';
+    document.getElementById('ob-webhook-secret').placeholder = ch.webhook.secret ? '•••••••• (已配置)' : '';
+  }
+
+  // Tunnel
+  const tSel = document.getElementById('ob-tunnel-provider');
+  if(tSel) tSel.value = (_rawConfig.tunnel?.provider || 'none');
+  document.getElementById('ob-tunnel-cf-token').value = '';
+  document.getElementById('ob-tunnel-ngrok-token').value = '';
+  document.getElementById('ob-tunnel-custom-cmd').value = _rawConfig.tunnel?.custom?.start_command || '';
+  document.getElementById('ob-tunnel-custom-health').value = _rawConfig.tunnel?.custom?.health_url || '';
+  document.getElementById('ob-tunnel-custom-pattern').value = _rawConfig.tunnel?.custom?.url_pattern || '';
+  document.getElementById('ob-tunnel-ts-funnel').checked = !!_rawConfig.tunnel?.tailscale?.funnel;
+  document.getElementById('ob-tunnel-ts-host').value = _rawConfig.tunnel?.tailscale?.hostname || '';
+  document.getElementById('ob-tunnel-ngrok-domain').value = _rawConfig.tunnel?.ngrok?.domain || '';
+
+  // Tool/Security
+  document.getElementById('ob-autonomy-level').value = (_rawConfig.autonomy?.level || 'supervised');
+  document.getElementById('ob-secrets-encrypt').checked = _rawConfig.secrets?.encrypt !== false;
+  document.getElementById('ob-composio-enabled').checked = !!_rawConfig.composio?.enabled;
+  document.getElementById('ob-composio-api-key').value = '';
+  document.getElementById('ob-composio-api-key').placeholder = _rawConfig.composio?.api_key ? '•••••••• (已配置)' : '';
+  document.getElementById('ob-composio-entity').value = _rawConfig.composio?.entity_id || 'default';
+
+  // Hardware
+  document.getElementById('ob-hw-enabled').checked = !!_rawConfig.hardware?.enabled;
+  document.getElementById('ob-hw-transport').value = (_rawConfig.hardware?.transport || 'None');
+  document.getElementById('ob-hw-serial-port').value = _rawConfig.hardware?.serial_port || '';
+  document.getElementById('ob-hw-baud').value = _rawConfig.hardware?.baud_rate ?? 115200;
+  document.getElementById('ob-hw-probe-target').value = _rawConfig.hardware?.probe_target || '';
+  document.getElementById('ob-hw-datasheets').checked = !!_rawConfig.hardware?.workspace_datasheets;
+
+  // Memory
+  document.getElementById('ob-mem-backend').value = (_rawConfig.memory?.backend || 'sqlite');
+  document.getElementById('ob-mem-autosave').checked = _rawConfig.memory?.auto_save !== false;
+  document.getElementById('ob-mem-retention').value = _rawConfig.memory?.conversation_retention_days ?? 30;
+  document.getElementById('ob-agent-max-history').value = _rawConfig.agent?.max_history_messages ?? 100;
+
+  // Project context defaults (best-effort)
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  const u = document.getElementById('ob-user-name');
+  const a = document.getElementById('ob-agent-name');
+  const t = document.getElementById('ob-timezone');
+  if(u && !u.value) u.value = 'User';
+  if(a && !a.value) a.value = 'ZeroClaw';
+  if(t && !t.value) t.value = tz;
+  const stylePreset = document.getElementById('ob-style-preset');
+  if(stylePreset && !stylePreset.value) stylePreset.value = 'friendly';
+  const langSel = document.getElementById('ob-comm-language');
+  const langCustom = document.getElementById('ob-lang-custom');
+  if(langSel && !langSel.dataset.inited){
+    const inferred = inferOnboardLanguagePreset();
+    if(inferred === 'custom' && langCustom && !langCustom.value) langCustom.value = navigator.language || 'English';
+    langSel.value = inferred;
+    langSel.dataset.inited = '1';
+  }
+}
+
+function renderOnboardStep(){
+  // Stepper active
+  document.querySelectorAll('.onboard-step-btn').forEach(btn=>{
+    const s = Number(btn.getAttribute('data-step')||0);
+    btn.classList.toggle('active', s===_onboardStep);
+  });
+
+  // Content
+  document.querySelectorAll('.onboard-step').forEach(el=>{
+    const s = Number(el.getAttribute('data-step')||0);
+    el.classList.toggle('active', s===_onboardStep);
+  });
+
+  // Buttons
+  const btnPrev = document.getElementById('ob-btn-prev');
+  const btnNext = document.getElementById('ob-btn-next');
+  if(btnPrev) btnPrev.disabled = _onboardStep<=0 || _onboardMode==='files';
+  if(btnNext) btnNext.textContent = (_onboardStep>=8) ? '完成并应用' : '下一步';
+
+  // Hint
+  const hint = document.getElementById('ob-footer-hint');
+  if(hint){
+    if(_onboardStep===2){
+      hint.textContent = '提示：OneBot v11 的「授权 QQ」留空会拒绝全部用户；填写 * 允许全部。';
+    } else if(_onboardStep===8){
+      hint.textContent = '最后一步：建议先生成工作区文件，再保存配置。';
+    } else {
+      hint.textContent = '';
+    }
+  }
+
+  // Mobile: if in files mode, hide stepper
+  const stepper = document.querySelector('.onboard-stepper');
+  if(stepper){
+    stepper.style.display = (_onboardMode==='files') ? 'none' : '';
+  }
+
+  // Ensure UI sections are correctly shown
+  onboardProviderChanged();
+  onboardTunnelChanged();
+  onboardComposioChanged();
+  onboardHardwareChanged();
+  onboardStylePresetChanged();
+  onboardLanguageChanged();
+  ['onebot','telegram','discord','webhook'].forEach(k=>onboardToggleChannel(k, true));
+}
+
+async function loadRawConfigForOnboard(){
+  const r = await fetch('/api/config/raw');
+  if(!r.ok) throw new Error('无法加载配置');
+  _rawConfig = await r.json();
+}
+
+window.openOnboardWizard = async function(force, mode){
+  _onboardMode = mode || 'full';
+  _onboardOpen = true;
+  _onboardStep = 0;
+  setOnboardOverlay(true);
+
+  // Clear finish output
+  const fin = document.getElementById('ob-finish-result');
+  if(fin) fin.innerHTML = '';
+
+  try{
+    await loadRawConfigForOnboard();
+  }catch(e){
+    // keep going; wizard can still scaffold files
+  }
+
+  _onboardStatus = await fetchOnboardStatus();
+  renderOnboardChecklist();
+  fillOnboardFormsFromConfig();
+  renderOnboardStep();
+
+  // Special modes
+  if(_onboardMode==='files'){
+    _onboardStep = 8;
+    renderOnboardStep();
+  }
+};
+
+window.closeOnboardWizard = function(){
+  _onboardOpen = false;
+  setOnboardOverlay(false);
+};
+
+window.onboardSkip = async function(){
+  try{ await fetch('/api/onboard/mark-done',{method:'POST'}); }catch(e){}
+  window.closeOnboardWizard();
+};
+
+window.gotoOnboardStep = function(step){
+  if(_onboardMode==='files') return;
+  _onboardStep = Math.max(0, Math.min(8, Number(step||0)));
+  renderOnboardStep();
+};
+
+window.onboardPrev = function(){
+  if(_onboardMode==='files') return;
+  _onboardStep = Math.max(0, _onboardStep-1);
+  renderOnboardStep();
+};
+
+window.onboardNext = async function(){
+  const btnNext = document.getElementById('ob-btn-next');
+  if(btnNext) btnNext.disabled = true;
+  try{
+    if(_onboardStep < 8 && _onboardMode!=='files'){
+      _onboardStep += 1;
+      renderOnboardStep();
+      return;
+    }
+
+    const res = await onboardFinishApply();
+    if(res?.requires_restart){
+      alert('配置保存成功！\n\n【注意】部分配置修改需要重启 ZeroClaw 进程才能完全生效。');
+    }
+    // Auto close after successful apply
+    window.closeOnboardWizard();
+  } catch(e) {
+    const msg = (e && e.message) ? e.message : String(e);
+    const fin = document.getElementById('ob-finish-result');
+    if(fin) fin.innerHTML += `<div class="context-note">应用失败：${esc(msg)}</div>`;
+    alert('应用失败：' + msg);
+  } finally {
+    if(btnNext) btnNext.disabled = false;
+  }
+};
+
+window.onboardProviderChanged = function(){
+  const provider = document.getElementById('ob-provider')?.value || 'openrouter';
+  const wrap = document.getElementById('ob-api-url-wrap');
+  if(wrap) wrap.style.display = (provider==='compatible') ? '' : 'none';
+};
+
+window.onboardTunnelChanged = function(){
+  const provider = document.getElementById('ob-tunnel-provider')?.value || 'none';
+  const boxes = {
+    cloudflare: document.getElementById('ob-tunnel-cloudflare'),
+    tailscale: document.getElementById('ob-tunnel-tailscale'),
+    ngrok: document.getElementById('ob-tunnel-ngrok'),
+    custom: document.getElementById('ob-tunnel-custom')
+  };
+  Object.entries(boxes).forEach(([k,el])=>{ if(el) el.style.display = (k===provider)?'':'none'; });
+};
+
+window.onboardComposioChanged = function(){
+  const on = !!document.getElementById('ob-composio-enabled')?.checked;
+  const box = document.getElementById('ob-composio-box');
+  if(box) box.style.display = on ? '' : 'none';
+};
+
+window.onboardHardwareChanged = function(){
+  const enabled = !!document.getElementById('ob-hw-enabled')?.checked;
+  const transport = document.getElementById('ob-hw-transport')?.value || 'None';
+  const serial = document.getElementById('ob-hw-serial');
+  const probe = document.getElementById('ob-hw-probe');
+  if(serial) serial.style.display = (enabled && transport==='Serial') ? '' : 'none';
+  if(probe) probe.style.display = (enabled && transport==='Probe') ? '' : 'none';
+};
+
+window.onboardStylePresetChanged = function(){
+  const v = document.getElementById('ob-style-preset')?.value || 'friendly';
+  const wrap = document.getElementById('ob-style-custom-wrap');
+  if(wrap) wrap.style.display = (v==='custom') ? '' : 'none';
+};
+
+window.onboardLanguageChanged = function(){
+  const v = document.getElementById('ob-comm-language')?.value || 'English';
+  const wrap = document.getElementById('ob-lang-custom-wrap');
+  if(wrap) wrap.style.display = (v==='custom') ? '' : 'none';
+};
+
+window.onboardToggleChannel = function(key, silent){
+  const ck = document.getElementById('ob-ch-'+key);
+  const body = document.getElementById('ob-ch-'+key+'-body');
+  if(!ck || !body) return;
+  body.style.display = ck.checked ? '' : 'none';
+
+  if(silent) return;
+  // defaults
+  if(key==='onebot' && ck.checked){
+    if(!document.getElementById('ob-onebot-api-url').value) document.getElementById('ob-onebot-api-url').value = 'http://127.0.0.1:3000';
+    if(!document.getElementById('ob-onebot-listen-host').value) document.getElementById('ob-onebot-listen-host').value = '0.0.0.0';
+    if(!document.getElementById('ob-onebot-listen-port').value) document.getElementById('ob-onebot-listen-port').value = '8096';
+    if(!document.getElementById('ob-onebot-allowed-users').value.trim()) document.getElementById('ob-onebot-allowed-users').value = '*';
+    if(document.getElementById('ob-onebot-require-at').checked === false) document.getElementById('ob-onebot-require-at').checked = true;
+  }
+  if(key==='webhook' && ck.checked){
+    if(!document.getElementById('ob-webhook-port').value) document.getElementById('ob-webhook-port').value = '8080';
+  }
+};
+
+window.onboardDiscoverModels = async function(){
+  const btn = document.getElementById('ob-discover-btn');
+  const status = document.getElementById('ob-discover-status');
+  const sel = document.getElementById('ob-discover-select');
+  if(btn){ btn.disabled = true; btn.textContent = '拉取中…'; }
+  if(status) status.textContent = '';
+  if(sel) sel.innerHTML = '<option value="">选择已发现模型…</option>';
+  try{
+    const providerId = document.getElementById('ob-provider')?.value || 'openrouter';
+    const apiUrl = (document.getElementById('ob-api-url')?.value || '').trim();
+    const apiKey = (document.getElementById('ob-api-key')?.value || '').trim();
+    const provider = (providerId==='compatible') ? `custom:${apiUrl}` : providerId;
+    const payload = { provider };
+    if(apiUrl) payload.api_url = apiUrl;
+    if(apiKey) payload.api_key = apiKey;
+    const r = await fetch('/api/models/discover',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(d.error||'自动拉取失败');
+    const models = Array.isArray(d.models) ? d.models : [];
+    if(sel){
+      sel.innerHTML = '<option value="">选择已发现模型…</option>' + models.map(m=>`<option value="${esc(m)}">${esc(m)}</option>`).join('');
+    }
+    if(status) status.textContent = models.length ? `已从 ${d.endpoint||'接口'} 拉取 ${models.length} 个模型` : '接口可达，但未返回模型列表';
+  }catch(e){
+    if(status) status.textContent = '拉取失败：' + (e.message||e);
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '从接口自动拉取模型'; }
+  }
+};
+
+window.onboardApplyDiscoveredModel = function(v){
+  if(!v) return;
+  const inp = document.getElementById('ob-model');
+  if(inp) inp.value = v;
+};
+
+function onboardStyleFromPreset(){
+  const p = document.getElementById('ob-style-preset')?.value || 'friendly';
+  if(p==='direct') return 'Be direct and concise. Skip pleasantries. Get to the point.';
+  if(p==='friendly') return 'Be friendly, human, and conversational. Show warmth and empathy while staying efficient. Use natural contractions.';
+  if(p==='professional') return 'Be professional and polished. Stay calm, structured, and respectful. Use occasional tone-setting emojis only when appropriate.';
+  if(p==='playful') return 'Be expressive and playful when appropriate. Use relevant emojis naturally (0-2 max), and keep serious topics emoji-light.';
+  if(p==='technical') return 'Be technical and detailed. Thorough explanations, code-first.';
+  if(p==='balanced') return 'Adapt to the situation. Default to warm and clear communication; be concise when needed, thorough when it matters.';
+  return (document.getElementById('ob-style-custom')?.value || '').trim();
+}
+
+function inferOnboardLanguagePreset(){
+  const lang = String(navigator.language || '').toLowerCase();
+  if(lang.startsWith('zh-cn') || lang.startsWith('zh-sg')) return '中文（简体）';
+  if(lang.startsWith('zh-tw') || lang.startsWith('zh-hk') || lang.startsWith('zh-mo')) return '中文（繁體）';
+  if(lang.startsWith('ja')) return '日本語';
+  if(lang.startsWith('ko')) return '한국어';
+  if(lang.startsWith('es')) return 'Español';
+  if(lang.startsWith('fr')) return 'Français';
+  if(lang.startsWith('de')) return 'Deutsch';
+  if(lang.startsWith('en')) return 'English';
+  return 'custom';
+}
+
+function onboardLanguageFromPreset(){
+  const v = (document.getElementById('ob-comm-language')?.value || '').trim();
+  if(v && v !== 'custom') return v;
+  const custom = (document.getElementById('ob-lang-custom')?.value || '').trim();
+  if(custom) return custom;
+  const inferred = inferOnboardLanguagePreset();
+  if(inferred && inferred !== 'custom') return inferred;
+  return 'English';
+}
+
+async function onboardFinishApply(){
+  const fin = document.getElementById('ob-finish-result');
+  if(fin) fin.innerHTML = '';
+
+  let requiresRestart = false;
+  const scaffold = !!document.getElementById('ob-scaffold-files')?.checked;
+
+  if(_onboardMode!=='files'){
+    // Apply form values into _rawConfig and save
+    if(!_rawConfig) await loadRawConfigForOnboard();
+    applyOnboardToRawConfig();
+
+    const r = await fetch('/api/config/raw',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(_rawConfig)});
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(d.error||'保存配置失败');
+    requiresRestart = !!d.requires_restart;
+    if(fin){
+      fin.innerHTML += `<div class="context-note">配置已保存。${d.requires_restart?'部分修改需要重启后生效。':''}</div>`;
+    }
+  }
+
+  if(scaffold){
+    const scaffoldResult = await runOnboardCreateWorkspaceFiles(true);
+    if(!scaffoldResult){
+      throw new Error('工作区文件生成失败，请检查下方错误信息后重试');
+    }
+  }
+
+  // Mark done
+  try{ await fetch('/api/onboard/mark-done',{method:'POST'}); }catch(e){}
+
+  // Refresh status in background
+  loadStatus();
+
+  return { requires_restart: requiresRestart, scaffolded: scaffold };
+}
+
+function applyOnboardToRawConfig(){
+  if(!_rawConfig) return;
+
+  // Provider
+  const providerId = document.getElementById('ob-provider')?.value || 'openrouter';
+  const model = (document.getElementById('ob-model')?.value || '').trim();
+  const apiKey = (document.getElementById('ob-api-key')?.value || '').trim();
+  const apiUrl = (document.getElementById('ob-api-url')?.value || '').trim();
+
+  if(providerId==='compatible'){
+    _rawConfig.default_provider = apiUrl ? `custom:${apiUrl}` : 'custom:';
+    if(apiUrl) _rawConfig.api_url = apiUrl;
+  } else {
+    _rawConfig.default_provider = providerId;
+  }
+  if(model) _rawConfig.default_model = model;
+  if(apiKey) _rawConfig.api_key = apiKey;
+
+  // Channels
+  if(!_rawConfig.channels_config) _rawConfig.channels_config = {};
+
+  // OneBot v11
+  const onebotOn = !!document.getElementById('ob-ch-onebot')?.checked;
+  if(!onebotOn){
+    _rawConfig.channels_config.onebot_v11 = null;
+  } else {
+    const prev = _rawConfig.channels_config.onebot_v11 || {};
+    const tokenInp = (document.getElementById('ob-onebot-token')?.value || '').trim();
+    const allowedUsers = str2arr(document.getElementById('ob-onebot-allowed-users')?.value || '');
+    const allowedGroups = str2arr(document.getElementById('ob-onebot-allowed-groups')?.value || '');
+    _rawConfig.channels_config.onebot_v11 = {
+      api_url: (document.getElementById('ob-onebot-api-url')?.value || prev.api_url || 'http://127.0.0.1:3000').trim(),
+      access_token: tokenInp ? tokenInp : (prev.access_token ?? null),
+      listen_host: (document.getElementById('ob-onebot-listen-host')?.value || prev.listen_host || '0.0.0.0').trim(),
+      listen_port: Number(document.getElementById('ob-onebot-listen-port')?.value || prev.listen_port || 8096) || 8096,
+      allowed_users: allowedUsers,
+      allowed_groups: allowedGroups,
+      require_at_in_group: !!document.getElementById('ob-onebot-require-at')?.checked,
+    };
+  }
+
+  // Telegram
+  const tgOn = !!document.getElementById('ob-ch-telegram')?.checked;
+  if(!tgOn){
+    _rawConfig.channels_config.telegram = null;
+  } else {
+    const prev = _rawConfig.channels_config.telegram || {};
+    const tokenInp = (document.getElementById('ob-telegram-token')?.value || '').trim();
+    _rawConfig.channels_config.telegram = {
+      bot_token: tokenInp || prev.bot_token || '',
+      allowed_users: str2arr(document.getElementById('ob-telegram-allowed')?.value || ''),
+    };
+  }
+
+  // Discord
+  const dsOn = !!document.getElementById('ob-ch-discord')?.checked;
+  if(!dsOn){
+    _rawConfig.channels_config.discord = null;
+  } else {
+    const prev = _rawConfig.channels_config.discord || {};
+    const tokenInp = (document.getElementById('ob-discord-token')?.value || '').trim();
+    const gid = (document.getElementById('ob-discord-guild')?.value || '').trim();
+    _rawConfig.channels_config.discord = {
+      bot_token: tokenInp || prev.bot_token || '',
+      guild_id: gid || prev.guild_id || null,
+      allowed_users: prev.allowed_users || [],
+      listen_to_bots: !!prev.listen_to_bots,
+      mention_only: !!prev.mention_only,
+    };
+  }
+
+  // Webhook
+  const whOn = !!document.getElementById('ob-ch-webhook')?.checked;
+  if(!whOn){
+    _rawConfig.channels_config.webhook = null;
+  } else {
+    const prev = _rawConfig.channels_config.webhook || {};
+    const secretInp = (document.getElementById('ob-webhook-secret')?.value || '').trim();
+    _rawConfig.channels_config.webhook = {
+      port: Number(document.getElementById('ob-webhook-port')?.value || prev.port || 8080) || 8080,
+      secret: secretInp ? secretInp : (prev.secret ?? null)
+    };
+  }
+
+  // Tunnel
+  if(!_rawConfig.tunnel) _rawConfig.tunnel = {provider:'none'};
+  const tProvider = document.getElementById('ob-tunnel-provider')?.value || 'none';
+  _rawConfig.tunnel.provider = tProvider;
+  if(tProvider==='cloudflare'){
+    const tok = (document.getElementById('ob-tunnel-cf-token')?.value || '').trim();
+    const prev = _rawConfig.tunnel.cloudflare || {};
+    _rawConfig.tunnel.cloudflare = { token: tok || prev.token || '' };
+    _rawConfig.tunnel.tailscale = null; _rawConfig.tunnel.ngrok=null; _rawConfig.tunnel.custom=null;
+  } else if(tProvider==='tailscale'){
+    const prev = _rawConfig.tunnel.tailscale || {};
+    _rawConfig.tunnel.tailscale = {
+      funnel: !!document.getElementById('ob-tunnel-ts-funnel')?.checked,
+      hostname: (document.getElementById('ob-tunnel-ts-host')?.value || '').trim() || prev.hostname || null,
+    };
+    _rawConfig.tunnel.cloudflare = null; _rawConfig.tunnel.ngrok=null; _rawConfig.tunnel.custom=null;
+  } else if(tProvider==='ngrok'){
+    const tok = (document.getElementById('ob-tunnel-ngrok-token')?.value || '').trim();
+    const prev = _rawConfig.tunnel.ngrok || {};
+    _rawConfig.tunnel.ngrok = {
+      auth_token: tok || prev.auth_token || '',
+      domain: (document.getElementById('ob-tunnel-ngrok-domain')?.value || '').trim() || prev.domain || null,
+    };
+    _rawConfig.tunnel.cloudflare = null; _rawConfig.tunnel.tailscale=null; _rawConfig.tunnel.custom=null;
+  } else if(tProvider==='custom'){
+    _rawConfig.tunnel.custom = {
+      start_command: (document.getElementById('ob-tunnel-custom-cmd')?.value || '').trim(),
+      health_url: (document.getElementById('ob-tunnel-custom-health')?.value || '').trim() || null,
+      url_pattern: (document.getElementById('ob-tunnel-custom-pattern')?.value || '').trim() || null,
+    };
+    _rawConfig.tunnel.cloudflare = null; _rawConfig.tunnel.tailscale=null; _rawConfig.tunnel.ngrok=null;
+  } else {
+    _rawConfig.tunnel.cloudflare = null; _rawConfig.tunnel.tailscale=null; _rawConfig.tunnel.ngrok=null; _rawConfig.tunnel.custom=null;
+  }
+
+  // Autonomy + secrets + composio
+  if(!_rawConfig.autonomy) _rawConfig.autonomy = {};
+  _rawConfig.autonomy.level = document.getElementById('ob-autonomy-level')?.value || 'supervised';
+  if(!_rawConfig.secrets) _rawConfig.secrets = {};
+  _rawConfig.secrets.encrypt = !!document.getElementById('ob-secrets-encrypt')?.checked;
+  if(!_rawConfig.composio) _rawConfig.composio = {};
+  _rawConfig.composio.enabled = !!document.getElementById('ob-composio-enabled')?.checked;
+  const composioKey = (document.getElementById('ob-composio-api-key')?.value || '').trim();
+  if(composioKey) _rawConfig.composio.api_key = composioKey;
+  _rawConfig.composio.entity_id = (document.getElementById('ob-composio-entity')?.value || 'default').trim() || 'default';
+
+  // Hardware
+  if(!_rawConfig.hardware) _rawConfig.hardware = {};
+  _rawConfig.hardware.enabled = !!document.getElementById('ob-hw-enabled')?.checked;
+  _rawConfig.hardware.transport = document.getElementById('ob-hw-transport')?.value || 'None';
+  _rawConfig.hardware.serial_port = (document.getElementById('ob-hw-serial-port')?.value || '').trim() || null;
+  _rawConfig.hardware.baud_rate = Number(document.getElementById('ob-hw-baud')?.value || 115200) || 115200;
+  _rawConfig.hardware.probe_target = (document.getElementById('ob-hw-probe-target')?.value || '').trim() || null;
+  _rawConfig.hardware.workspace_datasheets = !!document.getElementById('ob-hw-datasheets')?.checked;
+
+  // Memory
+  if(!_rawConfig.memory) _rawConfig.memory = {};
+  _rawConfig.memory.backend = document.getElementById('ob-mem-backend')?.value || 'sqlite';
+  _rawConfig.memory.auto_save = !!document.getElementById('ob-mem-autosave')?.checked;
+  _rawConfig.memory.conversation_retention_days = Number(document.getElementById('ob-mem-retention')?.value || 30) || 30;
+  if(!_rawConfig.agent) _rawConfig.agent = {};
+  _rawConfig.agent.max_history_messages = Number(document.getElementById('ob-agent-max-history')?.value || 100) || 100;
+}
+
+window.onboardCreateWorkspaceFiles = async function(silent){
+  return await runOnboardCreateWorkspaceFiles(!!silent);
+};
+
+async function runOnboardCreateWorkspaceFiles(silent){
+  const fin = document.getElementById('ob-finish-result');
+  try{
+    const payload = {
+      user_name: (document.getElementById('ob-user-name')?.value || '').trim(),
+      timezone: (document.getElementById('ob-timezone')?.value || '').trim(),
+      agent_name: (document.getElementById('ob-agent-name')?.value || '').trim(),
+      communication_style: onboardStyleFromPreset(),
+      communication_language: onboardLanguageFromPreset(),
+      mark_done: false,
+      refresh_personalization: _onboardMode !== 'files',
+    };
+    const r = await fetch('/api/onboard/scaffold',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(d.error||'生成失败');
+    if(fin){
+      const created = Array.isArray(d.created) ? d.created : [];
+      const skipped = Array.isArray(d.skipped) ? d.skipped : [];
+      const updated = Array.isArray(d.personalization_updated) ? d.personalization_updated : [];
+      const workspaceDir = typeof d.workspace_dir === 'string' ? d.workspace_dir.trim() : '';
+      const pathPart = workspaceDir ? ` 写入目录：<code>${esc(workspaceDir)}</code>。` : '';
+      const updatedPart = updated.length ? `，个性化更新 ${updated.length} 个` : '';
+      fin.innerHTML += `<div class="context-note">工作区文件已处理：创建 ${created.length} 个，跳过 ${skipped.length} 个${updatedPart}。${pathPart}</div>`;
+    }
+    _onboardStatus = await fetchOnboardStatus();
+    renderOnboardChecklist();
+    return d;
+  }catch(e){
+    if(!silent) alert('生成工作区文件失败：'+(e.message||e));
+    if(fin) fin.innerHTML += `<div class="context-note">生成工作区文件失败：${esc(e.message||String(e))}</div>`;
+    return null;
+  }
+}
+
+async function checkOnboardAutoShow(){
+  // Avoid auto-show if already open
+  if(onboardIsActive()) return;
+  const st = await fetchOnboardStatus();
+  if(st && st.needs_setup){
+    _onboardMode = 'full';
+    await window.openOnboardWizard(false, 'full');
+  }
+}
+
 loadStatus();
+checkOnboardAutoShow();
