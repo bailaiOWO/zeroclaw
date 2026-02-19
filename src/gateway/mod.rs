@@ -433,6 +433,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     if let Some(ref url) = tunnel_url {
         println!("  🌐 Public URL: {url}");
     }
+    println!("  🖥️  Web UI:     http://{display_addr}/");
     println!("  POST /pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST /webhook   — {{\"message\": \"your prompt\"}}");
     if whatsapp_channel.is_some() {
@@ -480,6 +481,20 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // Build router with middleware
     let app = Router::new()
+        .route("/", get(crate::webui::handle_index))
+        .route("/style.css", get(crate::webui::handle_style))
+        .route("/app.js", get(crate::webui::handle_app))
+        .route("/api/status", get(crate::webui::handle_api_status))
+        .route("/api/chat", post(crate::webui::handle_api_chat))
+        .route("/api/config", get(crate::webui::handle_api_config))
+        .route("/api/config", post(crate::webui::handle_api_config_mutate))
+        .route("/api/config/raw", get(crate::webui::handle_api_config_raw_get))
+        .route("/api/config/raw", post(crate::webui::handle_api_config_raw_post))
+        .route("/api/identity", get(crate::webui::handle_api_identity_get))
+        .route("/api/identity", post(crate::webui::handle_api_identity_post))
+        .route("/api/cron", get(crate::webui::handle_api_cron_list))
+        .route("/api/cron", post(crate::webui::handle_api_cron_mutate))
+        .route("/api/service", post(crate::webui::handle_api_service_mutate))
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))

@@ -70,6 +70,7 @@ mod skills;
 mod tools;
 mod tunnel;
 mod util;
+mod webui;
 
 use config::Config;
 
