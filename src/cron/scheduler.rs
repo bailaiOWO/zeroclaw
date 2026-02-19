@@ -1,5 +1,6 @@
 use crate::channels::{
-    Channel, DiscordChannel, MattermostChannel, SendMessage, SlackChannel, TelegramChannel,
+    Channel, DiscordChannel, MattermostChannel, OneBotV11Channel, QQChannel, SendMessage,
+    SlackChannel, TelegramChannel,
 };
 use crate::config::Config;
 use crate::cron::{
@@ -300,6 +301,28 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 mm.bot_token.clone(),
                 mm.channel_id.clone(),
                 mm.allowed_users.clone(),
+            );
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "onebot_v11" | "onebot-v11" | "onebot" | "napcat" => {
+            let ob = config
+                .channels_config
+                .onebot_v11
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("onebot_v11 channel not configured"))?;
+            let channel = OneBotV11Channel::new(ob.clone());
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "qq" => {
+            let qq = config
+                .channels_config
+                .qq
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("qq channel not configured"))?;
+            let channel = QQChannel::new(
+                qq.app_id.clone(),
+                qq.app_secret.clone(),
+                qq.allowed_users.clone(),
             );
             channel.send(&SendMessage::new(output, target)).await?;
         }
@@ -730,5 +753,33 @@ mod tests {
         };
         let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
         assert!(err.to_string().contains("unsupported delivery channel"));
+    }
+
+    #[tokio::test]
+    async fn deliver_if_configured_supports_qq_and_onebot_channel_names() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let mut onebot_job = test_job("echo ok");
+        onebot_job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("onebot_v11".into()),
+            to: Some("private:10001".into()),
+            best_effort: true,
+        };
+        let onebot_err = deliver_if_configured(&config, &onebot_job, "x")
+            .await
+            .unwrap_err();
+        assert!(onebot_err.to_string().contains("onebot_v11 channel not configured"));
+
+        let mut qq_job = test_job("echo ok");
+        qq_job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("qq".into()),
+            to: Some("user:10001".into()),
+            best_effort: true,
+        };
+        let qq_err = deliver_if_configured(&config, &qq_job, "x").await.unwrap_err();
+        assert!(qq_err.to_string().contains("qq channel not configured"));
     }
 }

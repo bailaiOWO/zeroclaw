@@ -26,6 +26,7 @@ function switchTab(name){
   if(['channels','providers','config'].includes(name)) loadConfig();
   if(name==='identity') loadIdentity();
   if(name==='cron') loadCron();
+  if(name==='chat') loadWebuiChatHistory();
   if(name==='history') loadConversations();
   if(name==='context-files'){
     loadContextFiles();
@@ -38,12 +39,14 @@ function refreshCurrent(){
   if(['channels','providers','config'].includes(currentTab)) loadConfig();
   if(currentTab==='identity') loadIdentity();
   if(currentTab==='cron') loadCron();
+  if(currentTab==='chat') loadWebuiChatHistory();
   if(currentTab==='history') loadConversations();
   if(currentTab==='context-files') loadContextFiles();
 }
 
 // ── Conversation history ─────────────────────────────────────────────────────
 let _conversationKind = 'private';
+const WEBUI_GLOBAL_SESSION_ID = 'webui:global';
 let _selectedConversationSession = '';
 
 function fmtLocalTimeFromUnix(ts){
@@ -54,6 +57,8 @@ function fmtLocalTimeFromUnix(ts){
 function formatConversationTarget(kind, target){
   const t = (target||'').trim();
   if(!t) return '';
+  if(t==='global' || kind==='global') return '全局会话';
+
   if(kind==='group' && t.startsWith('group:')) return '群聊 · '+t.slice('group:'.length);
   if(kind==='private' && (t.startsWith('private:')||t.startsWith('user:'))){
     const v = t.replace(/^private:/,'').replace(/^user:/,'');
@@ -70,16 +75,22 @@ async function loadConversationSettings(){
     const limit = d?.agent?.max_history_messages;
     const inp = document.getElementById('history-context-limit');
     if(inp && typeof limit === 'number') inp.value = String(limit);
+
+    const isolate = d?.agent?.isolate_channel_conversations;
+    const isolateToggle = document.getElementById('history-isolation-toggle');
+    if(isolateToggle && typeof isolate === 'boolean') isolateToggle.checked = isolate;
+
     const hint = document.getElementById('history-hint');
     if(hint && typeof limit === 'number'){
-      hint.textContent = `当前配置：每次对话将携带最近 ${limit} 条历史消息（保存后通常需要重启 daemon/channels 才会生效）。`;
+      const isolateTxt = isolate===false ? '关闭（频道将共用全局上下文）' : '开启（私聊/群聊按会话隔离）';
+      hint.textContent = `当前配置：每次对话将携带最近 ${limit} 条历史消息；频道隔离：${isolateTxt}（保存后通常需要重启 daemon/channels 才会生效）。`;
     }
   }catch(e){}
 }
 
 window.setConversationKind = function(kind){
   _conversationKind = kind || 'private';
-  ['private','group','other'].forEach(k=>{
+  ['private','group','global','other'].forEach(k=>{
     const btn = document.getElementById('history-kind-'+k);
     if(btn) btn.classList.toggle('active', _conversationKind===k);
   });
@@ -102,7 +113,7 @@ window.loadConversations = async function(){
     if(_conversationKind==='group' || _conversationKind==='private'){
       url += `&channel=onebot_v11&kind=${encodeURIComponent(_conversationKind)}`;
     } else {
-      url += `&kind=${encodeURIComponent(_conversationKind)}`;
+      url += `&kind=${encodeURIComponent(_conversationKind||'other')}`;
     }
     const r = await fetch(url);
     const d = await r.json().catch(()=>({}));
@@ -144,7 +155,9 @@ async function loadConversationMessages(sessionId){
   box.innerHTML = '<div class="empty-state"><span class="material-symbols-outlined">hourglass_empty</span><p>正在加载消息…</p></div>';
 
   try{
-    const url = `/api/conversations/messages?session_id=${encodeURIComponent(sessionId)}&limit=2000`;
+    const rawLimit = Number(document.getElementById('history-context-limit')?.value || 0);
+    const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.floor(rawLimit) : 2000;
+    const url = `/api/conversations/messages?session_id=${encodeURIComponent(sessionId)}&limit=${Math.min(Math.max(limit,1),5000)}`;
     const r = await fetch(url);
     const d = await r.json().catch(()=>({}));
     if(!r.ok) throw new Error(d.error||'加载失败');
@@ -181,6 +194,57 @@ async function loadConversationMessages(sessionId){
   }
 }
 
+async function clearConversationRecords(payload, confirmMessage){
+  if(!confirm(confirmMessage)) return;
+  try{
+    const r = await fetch('/api/conversations/clear',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload||{})
+    });
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(d.error||'清空失败');
+
+    const removed = Number(d.removed||0);
+    const skipped = Number(d.skipped||0);
+    if(skipped>0){
+      alert(`已处理，删除 ${removed} 条，跳过 ${skipped} 条（当前内存后端可能不支持删除）。`);
+    }else{
+      alert(`已删除 ${removed} 条聊天记录。`);
+    }
+  }catch(e){
+    alert('清空失败: '+(e.message||e));
+    return;
+  }
+
+  _selectedConversationSession = '';
+  const msgs = document.getElementById('history-messages');
+  if(msgs){
+    msgs.innerHTML = '<div class="empty-state" id="history-empty"><span class="material-symbols-outlined">forum</span><p>选择左侧会话查看消息</p></div>';
+  }
+  loadConversations();
+}
+
+window.clearSelectedConversation = async function(){
+  if(!_selectedConversationSession){
+    alert('请先选择要清空的会话');
+    return;
+  }
+  await clearConversationRecords(
+    { session_id: _selectedConversationSession },
+    `确定清空会话 ${_selectedConversationSession} 的聊天记录吗？此操作不可恢复。`
+  );
+};
+
+window.clearAllConversations = async function(){
+  await clearConversationRecords(
+    { all: true },
+    '确定清空全部聊天记录吗？此操作不可恢复。'
+  );
+};
+
+
+
 window.saveConversationContextLimit = async function(){
   const inp = document.getElementById('history-context-limit');
   if(!inp) return;
@@ -190,7 +254,12 @@ window.saveConversationContextLimit = async function(){
     return;
   }
   try{
-    const r = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'Agent',payload:{max_history_messages:Math.floor(v)}})});
+    const isolateToggle = document.getElementById('history-isolation-toggle');
+    const payload = {
+      max_history_messages: Math.floor(v),
+      isolate_channel_conversations: isolateToggle ? !!isolateToggle.checked : undefined,
+    };
+    const r = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'Agent',payload})});
     const d = await r.json().catch(()=>({}));
     if(!r.ok) throw new Error(d.error||'保存失败');
     alert('已保存（通常需要重启 daemon/channels 才会生效）');
@@ -199,6 +268,7 @@ window.saveConversationContextLimit = async function(){
     alert('保存失败: '+(e.message||e));
   }
 };
+
 
 function fmtUptime(s){
   if(s==null) return '—';
@@ -287,11 +357,21 @@ async function saveRawConfig(){
   flushFormsToConfig();
   const btn=event.target; const old=btn.textContent;
   btn.textContent='保存中…';btn.disabled=true;
+
+  const askRestartNow = async function(){
+    const yes = confirm('检测到部分配置需要重启 ZeroClaw 才能生效。\n\n是否现在尝试在前端直接重启服务？\n\n（若未安装服务，可先到「设置 → 系统守护进程」安装后再试）');
+    if(!yes){
+      alert('配置已保存。你可以稍后在「设置 → 系统守护进程」中点击“重启服务”。');
+      return;
+    }
+    await window.serviceCmd('restart');
+  };
+
   try{
     const r=await fetch('/api/config/raw',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(_rawConfig)});
     if(r.ok){
         const resp = await r.json();
-        if(resp.requires_restart) alert('配置保存成功！\n\n【注意】部分渠道或核心配置的修改，需要重新启动 ZeroClaw 进程才能生效。');
+        if(resp.requires_restart) await askRestartNow();
         else alert('配置保存成功！');
         loadStatus(); 
     }
@@ -939,13 +1019,53 @@ window.openCronAddModal = function(){
 };
 
 window.serviceCmd = async function(action){
+  const isRestart = action === 'restart';
   try{
     const r=await fetch('/api/service',{method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({action})});
     const d=await r.json().catch(()=>({}));
-    if(r.ok) alert('执行成功 ('+action+')');
+    if(r.ok){
+      if(isRestart) alert('已触发重启。WebUI 可能会短暂断开，请等待 3-10 秒后刷新页面确认。');
+      else alert('执行成功 ('+action+')');
+    }
     else alert('执行失败: '+(d.error||'请检查终端日志或权限'));
-  }catch(e){alert('网络错误')}
+  }catch(e){
+    if(isRestart) alert('重启请求已发出，连接可能因进程重启而中断。请等待几秒后刷新页面。');
+    else alert('网络错误');
+  }
 };
+
+async function loadWebuiChatHistory(){
+  const box = document.getElementById('messages');
+  if(!box) return;
+
+  try{
+    const rawLimit = Number(document.getElementById('history-context-limit')?.value || 0);
+    const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.floor(rawLimit) : 2000;
+    const url = `/api/conversations/messages?session_id=${encodeURIComponent(WEBUI_GLOBAL_SESSION_ID)}&limit=${Math.min(Math.max(limit,1),5000)}`;
+    const r = await fetch(url);
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(d.error||'加载失败');
+    const msgs = Array.isArray(d.messages) ? d.messages : [];
+
+    box.innerHTML = '';
+    if(!msgs.length){
+      box.innerHTML = '<div class="empty-state" id="empty-state"><span class="material-symbols-outlined">forum</span><p>发送消息开始对话</p></div>';
+      return;
+    }
+
+    for(const m of msgs){
+      const role = (m.role||'user').toLowerCase() === 'assistant' ? 'assistant' : 'user';
+      const div = document.createElement('div');
+      div.className = 'message ' + role;
+      div.textContent = m.text || '';
+      box.appendChild(div);
+    }
+    box.scrollTop = box.scrollHeight;
+  }catch(e){
+    box.innerHTML = '<div class="empty-state" id="empty-state"><span class="material-symbols-outlined">error</span><p>'+esc(e.message||'加载历史失败')+'</p></div>';
+  }
+}
+
 
 function appendMsg(role,text){
   const es=document.getElementById('empty-state');
@@ -1309,7 +1429,12 @@ window.onboardNext = async function(){
 
     const res = await onboardFinishApply();
     if(res?.requires_restart){
-      alert('配置保存成功！\n\n【注意】部分配置修改需要重启 ZeroClaw 进程才能完全生效。');
+      const yes = confirm('配置已保存，但部分修改需要重启 ZeroClaw 才会完全生效。\n\n是否现在尝试在前端直接重启服务？');
+      if(yes){
+        await window.serviceCmd('restart');
+      } else {
+        alert('配置已保存。你可以稍后在「设置 → 系统守护进程」中点击“重启服务”。');
+      }
     }
     // Auto close after successful apply
     window.closeOnboardWizard();

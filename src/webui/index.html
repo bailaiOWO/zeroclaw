@@ -230,6 +230,7 @@
           <div class="segmented" role="tablist" aria-label="会话类型">
             <button class="seg active" id="history-kind-private" role="tab" onclick="setConversationKind('private')">私聊</button>
             <button class="seg" id="history-kind-group" role="tab" onclick="setConversationKind('group')">群聊</button>
+            <button class="seg" id="history-kind-global" role="tab" onclick="setConversationKind('global')">全局</button>
             <button class="seg" id="history-kind-other" role="tab" onclick="setConversationKind('other')">其他</button>
           </div>
 
@@ -238,7 +239,13 @@
               <label>上下文消息数</label>
               <input class="form-input" type="number" id="history-context-limit" min="0" step="1" value="100">
             </div>
+            <label class="inline-toggle-label">
+              <input type="checkbox" id="history-isolation-toggle">
+              私聊/群聊隔离
+            </label>
             <button class="btn btn-fill btn-sm" onclick="saveConversationContextLimit()">保存</button>
+            <button class="btn btn-text btn-sm" onclick="clearSelectedConversation()">清空当前会话</button>
+            <button class="btn btn-error btn-sm" onclick="clearAllConversations()">清空全部记录</button>
           </div>
 
           <div class="history-hint" id="history-hint"></div>
@@ -454,6 +461,7 @@
             <div class="service-actions">
               <button class="btn btn-fill" onclick="serviceCmd('install')">注册并安装服务</button>
               <button class="btn btn-fill btn-secondary" onclick="serviceCmd('start')">启动服务</button>
+              <button class="btn btn-fill btn-secondary" onclick="serviceCmd('restart')">重启服务</button>
               <button class="btn btn-error" onclick="serviceCmd('stop')">停止</button>
               <button class="btn btn-text" onclick="serviceCmd('status')">查看状态</button>
               <button class="btn btn-outline-error" onclick="serviceCmd('uninstall')">卸载服务</button>

@@ -16,6 +16,7 @@ pub fn handle_command(command: &crate::ServiceCommands, config: &Config) -> Resu
         crate::ServiceCommands::Install => install(config),
         crate::ServiceCommands::Start => start(config),
         crate::ServiceCommands::Stop => stop(config),
+        crate::ServiceCommands::Restart => restart(config),
         crate::ServiceCommands::Status => status(config),
         crate::ServiceCommands::Uninstall => uninstall(config),
     }
@@ -29,7 +30,7 @@ fn install(config: &Config) -> Result<()> {
     } else if cfg!(target_os = "windows") {
         install_windows(config)
     } else {
-        anyhow::bail!("Service management is supported on macOS and Linux only");
+        anyhow::bail!("Service management is supported on macOS, Linux, and Windows");
     }
 }
 
@@ -52,7 +53,7 @@ fn start(config: &Config) -> Result<()> {
         Ok(())
     } else {
         let _ = config;
-        anyhow::bail!("Service management is supported on macOS and Linux only")
+        anyhow::bail!("Service management is supported on macOS, Linux, and Windows")
     }
 }
 
@@ -80,7 +81,49 @@ fn stop(config: &Config) -> Result<()> {
         Ok(())
     } else {
         let _ = config;
-        anyhow::bail!("Service management is supported on macOS and Linux only")
+        anyhow::bail!("Service management is supported on macOS, Linux, and Windows")
+    }
+}
+
+fn restart(config: &Config) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        let plist = macos_service_file()?;
+        let _ = run_checked(
+            Command::new("launchctl")
+                .arg("load")
+                .arg("-w")
+                .arg(&plist),
+        );
+
+        // Preferred: restart in one shot when launchctl target is resolvable.
+        if let Ok(uid) = std::env::var("UID") {
+            let target = format!("gui/{uid}/{SERVICE_LABEL}");
+            if run_checked(Command::new("launchctl").args(["kickstart", "-k", &target])).is_ok() {
+                println!("✅ Service restarted");
+                return Ok(());
+            }
+        }
+
+        // Fallback for environments where kickstart target is unavailable.
+        let _ = run_checked(Command::new("launchctl").arg("stop").arg(SERVICE_LABEL));
+        run_checked(Command::new("launchctl").arg("start").arg(SERVICE_LABEL))?;
+        println!("✅ Service restarted");
+        Ok(())
+    } else if cfg!(target_os = "linux") {
+        run_checked(Command::new("systemctl").args(["--user", "restart", "zeroclaw.service"]))?;
+        println!("✅ Service restarted");
+        Ok(())
+    } else if cfg!(target_os = "windows") {
+        let _ = config;
+        let script = format!(
+            "$n='{}'; try {{ Stop-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue | Out-Null }} catch {{}}; Start-ScheduledTask -TaskName $n",
+            windows_task_name()
+        );
+        run_checked(Command::new("powershell").args(["-NoProfile", "-Command", &script]))?;
+        println!("✅ Service restarted");
+        Ok(())
+    } else {
+        anyhow::bail!("Service management is supported on macOS, Linux, and Windows")
     }
 }
 
@@ -137,7 +180,7 @@ fn status(config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    anyhow::bail!("Service management is supported on macOS and Linux only")
+    anyhow::bail!("Service management is supported on macOS, Linux, and Windows")
 }
 
 fn uninstall(config: &Config) -> Result<()> {
@@ -181,7 +224,7 @@ fn uninstall(config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    anyhow::bail!("Service management is supported on macOS and Linux only")
+    anyhow::bail!("Service management is supported on macOS, Linux, and Windows")
 }
 
 fn install_macos(config: &Config) -> Result<()> {

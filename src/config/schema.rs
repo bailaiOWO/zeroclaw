@@ -201,6 +201,8 @@ pub struct AgentConfig {
     pub max_tool_iterations: usize,
     #[serde(default = "default_agent_max_history_messages")]
     pub max_history_messages: usize,
+    #[serde(default = "default_agent_isolate_channel_conversations")]
+    pub isolate_channel_conversations: bool,
     #[serde(default)]
     pub parallel_tools: bool,
     #[serde(default = "default_agent_tool_dispatcher")]
@@ -215,6 +217,10 @@ fn default_agent_max_history_messages() -> usize {
     100
 }
 
+fn default_agent_isolate_channel_conversations() -> bool {
+    true
+}
+
 fn default_agent_tool_dispatcher() -> String {
     "auto".into()
 }
@@ -225,6 +231,7 @@ impl Default for AgentConfig {
             compact_context: false,
             max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),
+            isolate_channel_conversations: default_agent_isolate_channel_conversations(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
         }
@@ -2477,6 +2484,7 @@ default_temperature = 0.7
         assert!(!cfg.compact_context);
         assert_eq!(cfg.max_tool_iterations, 10);
         assert_eq!(cfg.max_history_messages, 100);
+        assert!(cfg.isolate_channel_conversations);
         assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
     }
@@ -2489,6 +2497,7 @@ default_temperature = 0.7
 compact_context = true
 max_tool_iterations = 20
 max_history_messages = 80
+isolate_channel_conversations = false
 parallel_tools = true
 tool_dispatcher = "xml"
 "#;
@@ -2496,6 +2505,7 @@ tool_dispatcher = "xml"
         assert!(parsed.agent.compact_context);
         assert_eq!(parsed.agent.max_tool_iterations, 20);
         assert_eq!(parsed.agent.max_history_messages, 80);
+        assert!(!parsed.agent.isolate_channel_conversations);
         assert!(parsed.agent.parallel_tools);
         assert_eq!(parsed.agent.tool_dispatcher, "xml");
     }

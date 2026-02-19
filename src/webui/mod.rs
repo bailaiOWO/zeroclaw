@@ -15,6 +15,7 @@ use std::collections::HashSet;
 const INDEX_HTML: &str = include_str!("index.html");
 const STYLE_CSS: &str = include_str!("style.css");
 const APP_JS: &str = include_str!("app.js");
+const WEBUI_GLOBAL_SESSION_ID: &str = "webui:global";
 
 /// GET / — serve the Web UI HTML page
 pub async fn handle_index() -> impl IntoResponse {
@@ -103,6 +104,7 @@ pub async fn handle_api_config(State(state): State<AppState>) -> impl IntoRespon
             "compact_context": config.agent.compact_context,
             "max_tool_iterations": config.agent.max_tool_iterations,
             "max_history_messages": config.agent.max_history_messages,
+            "isolate_channel_conversations": config.agent.isolate_channel_conversations,
             "parallel_tools": config.agent.parallel_tools,
             "tool_dispatcher": &config.agent.tool_dispatcher,
         },
@@ -781,6 +783,8 @@ pub enum ConfigUpdate {
     },
     Agent {
         max_history_messages: usize,
+        #[serde(default)]
+        isolate_channel_conversations: Option<bool>,
     },
     ChannelTelegram {
         bot_token: String,
@@ -834,8 +838,14 @@ pub async fn handle_api_config_mutate(
                 }
             }
         }
-        ConfigUpdate::Agent { max_history_messages } => {
+        ConfigUpdate::Agent {
+            max_history_messages,
+            isolate_channel_conversations,
+        } => {
             config.agent.max_history_messages = max_history_messages;
+            if let Some(isolate) = isolate_channel_conversations {
+                config.agent.isolate_channel_conversations = isolate;
+            }
         }
         ConfigUpdate::ChannelTelegram { bot_token } => {
             config.channels_config.telegram = Some(crate::config::TelegramConfig {
@@ -916,7 +926,13 @@ pub async fn handle_api_chat(
     }
 
     let config = state.config.lock().clone();
-    match crate::agent::process_message(config, &req.message).await {
+    match crate::agent::process_message_with_session(
+        config,
+        &req.message,
+        Some(WEBUI_GLOBAL_SESSION_ID),
+    )
+    .await
+    {
         Ok(response) => {
             let body = serde_json::json!({
                 "response": response,
@@ -938,7 +954,7 @@ pub async fn handle_api_chat(
 #[derive(serde::Deserialize, Debug, Default)]
 pub struct ConversationsQuery {
     pub channel: Option<String>,
-    /// group | private | other
+    /// group | private | global | other
     pub kind: Option<String>,
     pub limit: Option<usize>,
 }
@@ -1005,7 +1021,9 @@ pub async fn handle_api_conversations_list(
             }
         }
 
-        let kind = if rest.starts_with("group:") {
+        let kind = if rest == "global" {
+            "global"
+        } else if rest.starts_with("group:") {
             "group"
         } else if rest.starts_with("private:") || rest.starts_with("user:") {
             "private"
@@ -1144,6 +1162,86 @@ pub async fn handle_api_conversations_messages(
     }
 
     (StatusCode::OK, Json(serde_json::json!({ "messages": messages })))
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+pub struct ConversationClearRequest {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub all: bool,
+}
+
+/// POST /api/conversations/clear — clear conversation records for one session or all sessions.
+pub async fn handle_api_conversations_clear(
+    State(state): State<AppState>,
+    body: Result<Json<ConversationClearRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    let Json(req) = match body {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+    };
+
+    let session = req
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if !req.all && session.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "session_id 不能为空，或传 all=true" })),
+        );
+    }
+
+    let entries = match state
+        .mem
+        .list(
+            Some(&crate::memory::MemoryCategory::Conversation),
+            if req.all { None } else { session },
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("WebUI clear conversations list error: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "无法读取聊天记录" })),
+            );
+        }
+    };
+
+    let mut seen_keys = HashSet::new();
+    let mut total = 0usize;
+    let mut removed = 0usize;
+    let mut skipped = 0usize;
+
+    for entry in entries {
+        if !seen_keys.insert(entry.key.clone()) {
+            continue;
+        }
+        total += 1;
+        match state.mem.forget(&entry.key).await {
+            Ok(true) => removed += 1,
+            Ok(false) => skipped += 1,
+            Err(e) => {
+                skipped += 1;
+                tracing::warn!("WebUI clear conversation key failed ({}): {e}", entry.key);
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "status": "ok", "total": total, "removed": removed, "skipped": skipped })),
+    )
 }
 
 #[derive(serde::Serialize)]
@@ -1531,7 +1629,7 @@ pub struct ServiceActionReq {
     pub action: String,
 }
 
-/// POST /api/service — start/stop/install system daemon
+/// POST /api/service — install/start/stop/restart/status/uninstall system daemon
 pub async fn handle_api_service_mutate(
     State(state): State<AppState>,
     body: Result<Json<ServiceActionReq>, axum::extract::rejection::JsonRejection>,
@@ -1548,6 +1646,7 @@ pub async fn handle_api_service_mutate(
     let cmd = match req.action.as_str() {
         "install" => crate::ServiceCommands::Install,
         "start" => crate::ServiceCommands::Start,
+        "restart" => crate::ServiceCommands::Restart,
         "stop" => crate::ServiceCommands::Stop,
         "status" => crate::ServiceCommands::Status,
         "uninstall" => crate::ServiceCommands::Uninstall,

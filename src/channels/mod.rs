@@ -81,20 +81,25 @@ struct ChannelRuntimeContext {
     auto_save_memory: bool,
     max_tool_iterations: usize,
     max_history_messages: usize,
+    isolate_channel_conversations: bool,
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.sender, msg.id)
 }
 
-fn conversation_session_id(msg: &traits::ChannelMessage) -> String {
+fn conversation_session_id(msg: &traits::ChannelMessage, isolate: bool) -> String {
+    if !isolate {
+        return format!("{}:global", msg.channel);
+    }
+
     // Session scoping decides how conversation history is grouped.
     //
     // Default: keep sessions isolated per-user per conversation target to prevent cross-user
     // leakage on shared channels.
     //
-    // OneBot v11 (NapCat): we want group conversations to share context across members,
-    // and private chats are naturally user-scoped by reply_target.
+    // OneBot v11 (NapCat): private and group conversations are isolated by reply_target.
+    // Group conversations still share context across members in the same group.
     if msg.channel == "onebot_v11" {
         return format!("{}:{}", msg.channel, msg.reply_target);
     }
@@ -275,6 +280,9 @@ fn channel_sender_context(msg: &traits::ChannelMessage) -> Option<String> {
         lines.push(format!("会话：{user_id}"));
     }
 
+    lines.push(format!("当前会话回复目标：{}", msg.reply_target));
+    lines.push("若创建 cron_add 定时任务且需要到点主动发消息，请设置 delivery.mode=announce、delivery.channel=onebot_v11、delivery.to=当前会话回复目标。".to_string());
+
     lines.push(format!("对方QQ：{}", msg.sender));
     if let Some(name) = msg.sender_name.as_deref().filter(|s| !s.trim().is_empty()) {
         lines.push(format!("对方昵称：{name}"));
@@ -346,7 +354,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         truncate_with_ellipsis(&msg.content, 80)
     );
 
-    let session_id = conversation_session_id(&msg);
+    let session_id = conversation_session_id(&msg, ctx.isolate_channel_conversations);
 
     let memory_context = build_memory_context(ctx.memory.as_ref(), &msg.content).await;
 
@@ -1520,6 +1528,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         auto_save_memory: config.memory.auto_save,
         max_tool_iterations: config.agent.max_tool_iterations,
         max_history_messages: config.agent.max_history_messages,
+        isolate_channel_conversations: config.agent.isolate_channel_conversations,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -1563,6 +1572,56 @@ mod tests {
         .unwrap();
         std::fs::write(tmp.path().join("MEMORY.md"), "# Memory\nUser likes Rust.").unwrap();
         tmp
+    }
+
+    #[test]
+    fn conversation_session_id_isolates_onebot_private_and_group() {
+        let private_msg = traits::ChannelMessage {
+            id: "1".into(),
+            sender: "10001".into(),
+            sender_name: Some("Alice".into()),
+            reply_target: "private:10001".into(),
+            content: "hi".into(),
+            channel: "onebot_v11".into(),
+            timestamp: 1,
+        };
+        let group_msg = traits::ChannelMessage {
+            id: "2".into(),
+            sender: "10001".into(),
+            sender_name: Some("Alice".into()),
+            reply_target: "group:20001".into(),
+            content: "hi".into(),
+            channel: "onebot_v11".into(),
+            timestamp: 2,
+        };
+
+        assert_eq!(
+            conversation_session_id(&private_msg, true),
+            "onebot_v11:private:10001"
+        );
+        assert_eq!(
+            conversation_session_id(&group_msg, true),
+            "onebot_v11:group:20001"
+        );
+        assert_ne!(
+            conversation_session_id(&private_msg, true),
+            conversation_session_id(&group_msg, true)
+        );
+    }
+
+    #[test]
+    fn conversation_session_id_can_fall_back_to_channel_global() {
+        let msg = traits::ChannelMessage {
+            id: "m".into(),
+            sender: "alice".into(),
+            sender_name: None,
+            reply_target: "group:20001".into(),
+            content: "hello".into(),
+            channel: "onebot_v11".into(),
+            timestamp: 1,
+        };
+
+        assert_eq!(conversation_session_id(&msg, false), "onebot_v11:global");
     }
 
     #[derive(Default)]
@@ -1746,6 +1805,7 @@ mod tests {
             auto_save_memory: false,
             max_tool_iterations: 10,
             max_history_messages: 0,
+            isolate_channel_conversations: true,
         });
 
         process_channel_message(
@@ -1790,6 +1850,7 @@ mod tests {
             auto_save_memory: false,
             max_tool_iterations: 10,
             max_history_messages: 0,
+            isolate_channel_conversations: true,
         });
 
         process_channel_message(
@@ -1888,6 +1949,7 @@ mod tests {
             auto_save_memory: false,
             max_tool_iterations: 10,
             max_history_messages: 0,
+            isolate_channel_conversations: true,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);

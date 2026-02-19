@@ -208,6 +208,11 @@ async fn build_context(mem: &dyn Memory, user_msg: &str) -> String {
 
     // Pull relevant memories for this message
     if let Ok(entries) = mem.recall(user_msg, 5, None).await {
+        let entries: Vec<_> = entries
+            .into_iter()
+            .filter(|e| e.category != MemoryCategory::Conversation)
+            .collect();
+
         if !entries.is_empty() {
             context.push_str("[Memory context]\n");
             for entry in &entries {
@@ -218,6 +223,106 @@ async fn build_context(mem: &dyn Memory, user_msg: &str) -> String {
     }
 
     context
+}
+
+const PROCESS_MESSAGE_AUTOSAVE_MAX_CHARS: usize = 4_000;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StoredConversationTurn {
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    timestamp: Option<u64>,
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+async fn load_session_conversation_history(
+    mem: &dyn Memory,
+    session_id: &str,
+    max_messages: usize,
+) -> Vec<ChatMessage> {
+    if max_messages == 0 {
+        return Vec::new();
+    }
+
+    let Ok(mut entries) = mem
+        .list(Some(&MemoryCategory::Conversation), Some(session_id))
+        .await
+    else {
+        return Vec::new();
+    };
+
+    entries.truncate(max_messages);
+    entries.reverse();
+
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let fallback_role = if entry.key.ends_with("_assistant") {
+            "assistant"
+        } else {
+            "user"
+        };
+
+        let mut role = fallback_role.to_string();
+        let mut text = entry.content.clone();
+        if let Ok(parsed) = serde_json::from_str::<StoredConversationTurn>(&entry.content) {
+            if !parsed.role.trim().is_empty() {
+                role = parsed.role;
+            }
+            if !parsed.text.trim().is_empty() {
+                text = parsed.text;
+            }
+        }
+
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+
+        match role.as_str() {
+            "assistant" => out.push(ChatMessage::assistant(text)),
+            _ => out.push(ChatMessage::user(text)),
+        }
+    }
+
+    out
+}
+
+async fn persist_session_conversation_turn(
+    mem: &dyn Memory,
+    session_id: &str,
+    role: &str,
+    text: &str,
+) {
+    let trimmed = truncate_with_ellipsis(text, PROCESS_MESSAGE_AUTOSAVE_MAX_CHARS);
+    if trimmed.trim().is_empty() {
+        return;
+    }
+
+    let key = if role == "assistant" {
+        format!("session_{}_assistant", autosave_memory_key("msg"))
+    } else {
+        autosave_memory_key("session_msg")
+    };
+
+    let stored = serde_json::to_string(&StoredConversationTurn {
+        role: role.to_string(),
+        text: trimmed.clone(),
+        timestamp: Some(now_unix_secs()),
+    })
+    .unwrap_or(trimmed);
+
+    let _ = mem
+        .store(&key, &stored, MemoryCategory::Conversation, Some(session_id))
+        .await;
 }
 
 /// Build hardware datasheet context from RAG when peripherals are enabled.
@@ -1356,10 +1461,24 @@ pub async fn run(
 }
 
 /// Process a single message through the full agent (with tools, peripherals, memory).
-/// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
+    process_message_with_session(config, message, None).await
+}
+
+/// Process a single message through the full agent (with tools, peripherals, memory),
+/// optionally binding it to a durable conversation session.
+///
+/// When `session_id` is provided and memory auto-save is enabled, previous conversation
+/// turns from that session are loaded and appended to prompt history; new user/assistant
+/// turns are persisted back to the same session.
+pub async fn process_message_with_session(
+    config: Config,
+    message: &str,
+    session_id: Option<&str>,
+) -> Result<String> {
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
+
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -1401,6 +1520,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = config
         .default_model
+
         .clone()
         .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
     let provider: Box<dyn Provider> = providers::create_routed_provider(
@@ -1486,6 +1606,17 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     );
     system_prompt.push_str(&build_tool_instructions(&tools_registry));
 
+    let session_id = session_id.map(str::to_string);
+    let conversation_history = if config.memory.auto_save {
+        if let Some(sid) = session_id.as_deref() {
+            load_session_conversation_history(mem.as_ref(), sid, config.agent.max_history_messages).await
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
     let mem_context = build_context(mem.as_ref(), message).await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
     let hw_context = hardware_rag
@@ -1499,12 +1630,18 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         format!("{context}{message}")
     };
 
-    let mut history = vec![
-        ChatMessage::system(&system_prompt),
-        ChatMessage::user(&enriched),
-    ];
+    if config.memory.auto_save {
+        if let Some(sid) = session_id.as_deref() {
+            persist_session_conversation_turn(mem.as_ref(), sid, "user", message).await;
+        }
+    }
 
-    agent_turn(
+    let mut history = Vec::with_capacity(2 + conversation_history.len());
+    history.push(ChatMessage::system(&system_prompt));
+    history.extend(conversation_history);
+    history.push(ChatMessage::user(&enriched));
+
+    let response = agent_turn(
         provider.as_ref(),
         &mut history,
         &tools_registry,
@@ -1514,7 +1651,15 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         config.default_temperature,
         true,
     )
-    .await
+    .await?;
+
+    if config.memory.auto_save {
+        if let Some(sid) = session_id.as_deref() {
+            persist_session_conversation_turn(mem.as_ref(), sid, "assistant", &response).await;
+        }
+    }
+
+    Ok(response)
 }
 
 #[cfg(test)]

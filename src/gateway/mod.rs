@@ -494,6 +494,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/conversations/messages",
             get(crate::webui::handle_api_conversations_messages),
         )
+        .route(
+            "/api/conversations/clear",
+            post(crate::webui::handle_api_conversations_clear),
+        )
         .route("/api/config", get(crate::webui::handle_api_config))
         .route("/api/config", post(crate::webui::handle_api_config_mutate))
         .route(

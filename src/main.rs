@@ -96,6 +96,8 @@ enum ServiceCommands {
     Start,
     /// Stop daemon service
     Stop,
+    /// Restart daemon service
+    Restart,
     /// Check daemon service status
     Status,
     /// Uninstall daemon service unit
