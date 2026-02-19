@@ -1,11 +1,15 @@
 const pageTitles = {
   dashboard:'仪表盘', chat:'对话', channels:'消息平台',
   providers:'模型与路由', config:'更多配置', settings:'设置', 
-  identity:'身份设定', cron:'定时任务'
+  identity:'身份设定', cron:'定时任务',
+  'context-files':'上下文文件'
 };
 let currentTab = 'dashboard';
+let contextAutoRefreshEnabled = false;
+let contextAutoRefreshTimer = null;
 
 function switchTab(name){
+  const previous = currentTab;
   currentTab = name;
   document.querySelectorAll('.nav-item').forEach(btn=>{
     btn.classList.toggle('active', btn.getAttribute('onclick').includes("'"+name+"'"));
@@ -17,9 +21,15 @@ function switchTab(name){
   if(cc) cc.classList.toggle('active', name==='chat');
   document.getElementById('page-title').textContent = pageTitles[name]||name;
 
+  if(previous==='context-files' && name!=='context-files') stopContextAutoRefresh();
+
   if(['channels','providers','config'].includes(name)) loadConfig();
   if(name==='identity') loadIdentity();
   if(name==='cron') loadCron();
+  if(name==='context-files'){
+    loadContextFiles();
+    if(contextAutoRefreshEnabled) startContextAutoRefresh();
+  }
 }
 
 function refreshCurrent(){
@@ -27,6 +37,7 @@ function refreshCurrent(){
   if(['channels','providers','config'].includes(currentTab)) loadConfig();
   if(currentTab==='identity') loadIdentity();
   if(currentTab==='cron') loadCron();
+  if(currentTab==='context-files') loadContextFiles();
 }
 
 function fmtUptime(s){
@@ -50,6 +61,9 @@ function arr2str(arr){ return (arr||[]).join(', '); }
 function str2arr(str){ return (str||'').split(',').map(s=>s.trim()).filter(Boolean); }
 
 let _rawConfig = null;
+let _providerModelCandidates = {};
+let _providerModelStatus = {};
+let currentContextFile = '';
 
 async function loadStatus(){
   try{
@@ -64,6 +78,15 @@ async function loadStatus(){
     document.getElementById('v-provider').textContent=stripCustom(d.provider)||'—';
     document.getElementById('v-model').textContent=d.model||'—';
     document.getElementById('v-temp').textContent=d.temperature??'—';
+    document.getElementById('v-config-model').textContent=d.configured_model||'—';
+    const modelAlert = document.getElementById('v-model-alert');
+    if(modelAlert){
+      const needsRestart = !!d.model_needs_restart;
+      modelAlert.classList.toggle('is-hidden', !needsRestart);
+      if(needsRestart){
+        modelAlert.textContent = `检测到运行模型(${d.model||'—'}) 与配置模型(${d.configured_model||'—'}) 不一致：重启后才会完全生效。`;
+      }
+    }
     document.getElementById('v-autonomy').textContent=d.autonomy_level||'—';
     document.getElementById('v-memory').textContent=d.memory_backend||'—';
     document.getElementById('v-autosave').textContent=d.auto_save?'已启用':'已禁用';
@@ -106,7 +129,12 @@ async function saveRawConfig(){
   btn.textContent='保存中…';btn.disabled=true;
   try{
     const r=await fetch('/api/config/raw',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(_rawConfig)});
-    if(r.ok){ alert('配置保存成功！'); loadStatus(); }
+    if(r.ok){
+        const resp = await r.json();
+        if(resp.requires_restart) alert('配置保存成功！\n\n【注意】部分渠道或核心配置的修改，需要重新启动 ZeroClaw 进程才能生效。');
+        else alert('配置保存成功！');
+        loadStatus(); 
+    }
     else alert('保存失败:'+await r.text());
   }catch(e){alert('网络错误')}
   finally{btn.textContent=old;btn.disabled=false;}
@@ -141,7 +169,7 @@ function renderChannels(cfg){
     el.innerHTML=`
       <div class="expandable-header" onclick="toggleExpand(this)">
         <div class="expandable-icon"><span class="material-symbols-outlined">${c.icon}</span></div>
-        <div style="flex:1">
+        <div class="expandable-main">
           <div class="expandable-title">${esc(c.name)}</div>
           <div class="expandable-subtitle">${esc(c.desc)}</div>
         </div>
@@ -150,7 +178,7 @@ function renderChannels(cfg){
              onchange="window.toggleChannel(this, '${c.key}', this.checked)">
           <span class="switch-slider"></span>
         </div>
-        <span class="material-symbols-outlined chevron-icon" style="margin-left:12px">expand_more</span>
+        <span class="material-symbols-outlined chevron-icon">expand_more</span>
       </div>
       <div class="expandable-body-wrapper">
         <div class="expandable-body">
@@ -161,15 +189,16 @@ function renderChannels(cfg){
     box.appendChild(el);
 
     const b = el.querySelector('.expandable-body-inner');
-    if(Object.keys(c.schema).length===0) b.innerHTML='<div style="color:var(--md-on-surface-variant);font-size:13px">无需额外配置。</div>';
+    if(Object.keys(c.schema).length===0) b.innerHTML='<div class="form-empty">无需额外配置。</div>';
     for(const [k, type] of Object.entries(c.schema)){
       const fg=document.createElement('div');fg.className='form-group';
       let val = data[k];
+      const label = CH_DICT[k] || k;
       if(type==='arr') val = arr2str(val);
       if(type==='bool'){
-        fg.innerHTML=`<label style="display:flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" data-path="channels_config.${c.key}.${k}" ${val?'checked':''}> <span style="font-size:14px;color:var(--md-on-surface)">${k}</span></label>`;
+        fg.innerHTML=`<label class="checkbox-field"><input type="checkbox" data-path="channels_config.${c.key}.${k}" ${val?'checked':''}> <span>${esc(label)}</span></label>`;
       }else{
-        fg.innerHTML=`<label>${k}</label><input class="form-input" type="${type==='num'?'number':'text'}" data-path="channels_config.${c.key}.${k}" value="${esc(val||'')}">`;
+        fg.innerHTML=`<label>${esc(label)}</label><input class="form-input" type="${type==='num'?'number':'text'}" data-path="channels_config.${c.key}.${k}" data-valtype="${type}" value="${esc(val??'')}">`;
       }
       b.appendChild(fg);
     }
@@ -181,7 +210,16 @@ window.toggleChannel = function(el, key, checked){
     _rawConfig.channels_config.cli = checked;
   }else{
     if(checked) {
-      if(!_rawConfig.channels_config[key]) _rawConfig.channels_config[key] = {};
+      if(!_rawConfig.channels_config[key]) {
+         _rawConfig.channels_config[key] = {};
+         if(key === 'lark') {
+             _rawConfig.channels_config.lark.receive_mode = 'websocket';
+             _rawConfig.channels_config.lark.port = 8080;
+         }
+         if(key === 'webhook') {
+             _rawConfig.channels_config.webhook.port = 8080;
+         }
+      }
     } else {
       _rawConfig.channels_config[key] = null;
     }
@@ -219,43 +257,65 @@ function renderProviders(cfg){
   let isCustom = rawProvider.startsWith('custom:');
   let currentId = stripCustom(rawProvider).toLowerCase();
   
+  const compatibleUrlValue = rawProvider.startsWith('custom:') ? stripCustom(rawProvider) : (cfg.api_url||'');
+
   const displayProviders = [...ALL_PROVIDERS];
-  if (rawProvider && !ALL_PROVIDERS.find(p => p.id === currentId || p.id === rawProvider)) {
+  if (rawProvider && !rawProvider.startsWith('custom:') && !ALL_PROVIDERS.find(p => p.id === currentId || p.id === rawProvider)) {
      displayProviders.unshift({ id: rawProvider, name: isCustom ? rawProvider : '自定义: ' + rawProvider });
   }
 
   const box=document.getElementById('providers-list');
   box.innerHTML='';
   for(const p of displayProviders){
-    const isActive = currentId === p.id || rawProvider === p.id || currentId.startsWith(p.id);
+    const discovered = _providerModelCandidates[p.id] || [];
+    const discoverStatus = _providerModelStatus[p.id] || '';
+
+    const isActive = currentId === p.id
+      || rawProvider === p.id
+      || currentId.startsWith(p.id)
+      || (p.id==='compatible' && rawProvider.startsWith('custom:'));
     const el=document.createElement('div');
     el.className='expandable-item'+(isActive?' active-item':'');
     el.innerHTML=`
       <div class="expandable-header" onclick="toggleExpand(this)">
         <div class="expandable-icon"><span class="material-symbols-outlined">dns</span></div>
-        <div style="flex:1">
-          <div class="expandable-title">${esc(p.name)} ${isActive?'<span style="color:var(--md-primary);font-size:12px">(默认激活)</span>':''}</div>
+        <div class="expandable-main">
+          <div class="expandable-title">${esc(p.name)} ${isActive?'<span class="provider-active-tag">默认激活</span>':''}</div>
         </div>
-        ${!isActive?`<button class="btn btn-text" style="height:32px;padding:0 12px" onclick="event.stopPropagation();setDefaultProvider('${p.id}')">设为全局默认</button>`:''}
+        ${!isActive?`<button class="btn btn-text btn-sm" onclick="event.stopPropagation();setDefaultProvider('${p.id}')">设为全局默认</button>`:''}
         <span class="material-symbols-outlined chevron-icon">expand_more</span>
       </div>
       <div class="expandable-body-wrapper">
         <div class="expandable-body">
           <div class="expandable-body-inner config-grid">
             <div class="form-group">
-               <label>默认模型 (Model)</label>
-               <input class="form-input" type="text" id="pv-mod-${p.id}" ${isActive?'data-path="default_model"':''} value="${isActive?esc(cfg.default_model||''):''}" placeholder="填入具体模型代号">
+              <label>默认模型（Model）</label>
+              <div class="inline-field provider-model-row">
+                <input class="form-input" type="text" id="pv-mod-${p.id}" ${isActive?'data-path="default_model"':''} value="${isActive?esc(cfg.default_model||''):''}" placeholder="填入具体模型代号">
+                <button class="btn btn-text btn-sm" id="pv-discover-btn-${p.id}" onclick="event.stopPropagation();discoverProviderModels('${p.id}')">从 URL 自动拉取</button>
+              </div>
+              <div class="field-hint" id="pv-discover-status-${p.id}">${esc(discoverStatus)}</div>
+              ${discovered.length?`
+              <select class="form-input provider-model-select" id="pv-discover-select-${p.id}" onchange="applyDiscoveredModel('${p.id}', this.value)">
+                <option value="">选择已发现模型 (${discovered.length})…</option>
+                ${discovered.map(m=>`<option value="${esc(m)}">${esc(m)}</option>`).join('')}
+              </select>
+              `:''}
             </div>
+
             <div class="form-group">
                <label>API Key / 鉴权令牌</label>
                <input class="form-input" type="password" id="pv-key-${p.id}" ${isActive?'data-path="api_key"':''} placeholder="${isActive?(cfg.api_key?'•••••••• (已配置)':'未配置'):'激活后生效'}">
             </div>
+
             ${p.id==='compatible'?`
             <div class="form-group">
                <label>自定义 API Base URL</label>
-               <input class="form-input" type="text" ${isActive?'data-path="api_url"':''} value="${isActive?esc(cfg.api_url||''):''}" placeholder="例如: https://api.openai.com/v1">
+               <input class="form-input" type="text" id="pv-url-${p.id}" ${isActive?'data-path="api_url"':''} value="${isActive?esc(compatibleUrlValue||''):''}" placeholder="例如: https://api.openai.com/v1">
             </div>
             `:''}
+
+            ${isActive?`<div class="field-hint full-span">提示：自动拉取会优先使用当前输入框里的 URL / API Key；为空时回退到已保存配置。</div>`:''}
           </div>
         </div>
       </div>
@@ -269,26 +329,83 @@ function renderProviders(cfg){
   for(let i=0; i<routes.length; i++){
     const r = routes[i];
     const el=document.createElement('div');
-    el.style.cssText='display:flex;gap:8px;align-items:center;margin-bottom:8px';
+    el.className='model-route-row';
     el.innerHTML=`
-      <input class="form-input" style="width:100px" placeholder="Hint (任务)" data-path="model_routes.${i}.hint" value="${esc(r.hint)}">
-      <input class="form-input" style="width:120px" placeholder="Provider (渠道)" data-path="model_routes.${i}.provider" value="${esc(r.provider)}">
-      <input class="form-input" style="flex:1" placeholder="Model (模型)" data-path="model_routes.${i}.model" value="${esc(r.model)}">
-      <button class="btn btn-error" style="padding:0 12px" onclick="_rawConfig.model_routes.splice(${i},1);renderProviders(_rawConfig)">删除</button>
+      <input class="form-input" placeholder="Hint (任务)" data-path="model_routes.${i}.hint" value="${esc(r.hint)}">
+      <input class="form-input" placeholder="Provider (渠道)" data-path="model_routes.${i}.provider" value="${esc(r.provider)}">
+      <input class="form-input" placeholder="Model (模型)" data-path="model_routes.${i}.model" value="${esc(r.model)}">
+      <button class="btn btn-error btn-sm" onclick="_rawConfig.model_routes.splice(${i},1);renderProviders(_rawConfig)">删除</button>
     `;
     mb.appendChild(el);
   }
 }
 
 window.setDefaultProvider = function(id){
-  if(id==='compatible') _rawConfig.default_provider='custom:';
-  else _rawConfig.default_provider = id;
+  if(id==='compatible'){
+    const url = (document.getElementById('pv-url-compatible')?.value || _rawConfig.api_url || '').trim();
+    _rawConfig.default_provider = url ? `custom:${url}` : 'custom:';
+    if(url) _rawConfig.api_url = url;
+  }
+  else {
+    _rawConfig.default_provider = id;
+  }
   const mod = document.getElementById('pv-mod-'+id)?.value;
   if(mod) _rawConfig.default_model = mod;
   const k = document.getElementById('pv-key-'+id)?.value;
   if(k) _rawConfig.api_key = k;
   renderProviders(_rawConfig);
 };
+
+function resolveProviderForDiscovery(providerId){
+  const raw = (_rawConfig?.default_provider||'').trim();
+  if(!raw) return providerId;
+  if(providerId===raw) return raw;
+  if(providerId==='compatible'){
+    if(raw.startsWith('custom:')) return raw;
+    return providerId;
+  }
+  if(stripCustom(raw).toLowerCase()===providerId && raw.startsWith('custom:')) return raw;
+  return providerId;
+}
+
+window.discoverProviderModels = async function(providerId){
+  if(!_rawConfig) return;
+  flushFormsToConfig();
+  const btn = document.getElementById('pv-discover-btn-'+providerId);
+  const old = btn ? btn.textContent : '';
+  if(btn){ btn.disabled = true; btn.textContent = '拉取中…'; }
+  try{
+    const payload = { provider: resolveProviderForDiscovery(providerId) };
+    const apiUrl = (document.getElementById('pv-url-'+providerId)?.value || _rawConfig.api_url || '').trim();
+    const apiKey = (document.getElementById('pv-key-'+providerId)?.value || _rawConfig.api_key || '').trim();
+    if(apiUrl) payload.api_url = apiUrl;
+    if(apiKey) payload.api_key = apiKey;
+
+    const r = await fetch('/api/models/discover',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(d.error||'自动拉取失败');
+
+    const models = Array.isArray(d.models) ? d.models : [];
+    _providerModelCandidates[providerId] = models;
+    _providerModelStatus[providerId] = models.length
+      ? `已从 ${d.endpoint||'接口'} 拉取 ${models.length} 个模型`
+      : '接口可达，但未返回模型列表';
+    renderProviders(_rawConfig);
+  }catch(e){
+    _providerModelStatus[providerId] = `拉取失败：${e.message||e}`;
+    renderProviders(_rawConfig);
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = old; }
+  }
+};
+
+window.applyDiscoveredModel = function(providerId, model){
+  if(!model) return;
+  const input = document.getElementById('pv-mod-'+providerId);
+  if(input) input.value = model;
+  if(input?.getAttribute('data-path')==='default_model') _rawConfig.default_model = model;
+};
+
 window.addModelRoute = function(){
   if(!_rawConfig.model_routes) _rawConfig.model_routes=[];
   _rawConfig.model_routes.push({hint:'',provider:'',model:''});
@@ -370,7 +487,7 @@ function renderRawConfig(cfg){
     el.innerHTML=`
       <div class="expandable-header" onclick="toggleExpand(this)">
         <div class="expandable-icon"><span class="material-symbols-outlined">${sec.icon}</span></div>
-        <div class="expandable-title">${sec.name} <span style="opacity:0.5;font-size:12px;margin-left:4px">[${sec.key}]</span></div>
+        <div class="expandable-title">${sec.name} <span class="section-key">[${sec.key}]</span></div>
         <span class="material-symbols-outlined chevron-icon">expand_more</span>
       </div>
       <div class="expandable-body-wrapper">
@@ -380,14 +497,14 @@ function renderRawConfig(cfg){
               const val = obj[k];
               const labelZh = dict[k] || k;
               if(typeof val === 'boolean'){
-                return '<label style="display:flex;align-items:center;gap:8px;cursor:pointer">'+
+                return '<label class="checkbox-field">'+
                   '<input type="checkbox" data-path="'+sec.key+'.'+k+'" '+(val?'checked':'')+'> '+
-                  '<span style="font-size:14px;color:var(--md-on-surface)">'+labelZh+'</span></label>';
+                  '<span>'+labelZh+'</span></label>';
               }
               const isArr = Array.isArray(val);
               return '<div class="form-group">'+
                 '<label>'+labelZh+(isArr?' (逗号分隔)':'')+'</label>'+
-                '<input class="form-input" type="text" data-path="'+sec.key+'.'+k+'" value="'+esc(isArr?arr2str(val):(val??''))+'">'+
+                '<input class="form-input" type="text" data-path="'+sec.key+'.'+k+'" data-valtype="'+(isArr?'arr':'')+'" value="'+esc(isArr?arr2str(val):(val??''))+'">'+
               '</div>';
             }).join('')}
           </div>
@@ -406,8 +523,8 @@ function setPath(obj, path, value) {
         curr = curr[keys[i]];
     }
     const last = keys[keys.length - 1];
-    if (Array.isArray(curr[last])) curr[last] = str2arr(value);
-    else if(typeof curr[last] === 'number') curr[last] = Number(value)||0;
+    if (Array.isArray(curr[last]) && typeof value === 'string') curr[last] = str2arr(value);
+    else if(typeof curr[last] === 'number' && typeof value === 'string') curr[last] = Number(value)||0;
     else curr[last] = value;
 }
 
@@ -415,8 +532,30 @@ function flushFormsToConfig() {
   if(!_rawConfig) return;
   document.querySelectorAll('[data-path]').forEach(el => {
     const path = el.getAttribute('data-path');
+    const vtype = el.getAttribute('data-valtype');
+    const pathStr = String(path);
+
+    if (pathStr.startsWith('channels_config.')) {
+        const chKey = pathStr.split('.')[1];
+        if (chKey !== 'cli' && !_rawConfig.channels_config[chKey]) return;
+    }
+
+    // Password fields (e.g. provider api_key) are intentionally rendered empty
+    // and only show placeholder text like "•••• 已配置".
+    // If we blindly write empty string back, saving unrelated sections (channels,
+    // settings, etc.) will erase existing secrets from config.toml.
+    // Therefore: empty password input means "keep current value".
+    if (el.type === 'password' && !el.value) return;
+
     if(el.type === 'checkbox') setPath(_rawConfig, path, el.checked);
-    else setPath(_rawConfig, path, el.value);
+    else if(vtype === 'arr') setPath(_rawConfig, path, str2arr(el.value));
+    else if(vtype === 'num') setPath(_rawConfig, path, Number(el.value)||0);
+    else {
+        let finalVal = el.value;
+        if(pathStr === 'channels_config.lark.receive_mode' && !finalVal) finalVal = 'websocket';
+        if(pathStr === 'channels_config.lark.use_feishu' && finalVal === '') finalVal = false;
+        setPath(_rawConfig, path, finalVal);
+    }
   });
 }
 
@@ -451,11 +590,10 @@ async function loadIdentity(){
     const box = document.getElementById('identity-file-list');
     box.innerHTML='';
     for(const f of d.files){
-      const el=document.createElement('div');
-      el.style.cssText=`padding:8px 12px;border-radius:8px;cursor:pointer;font-size:14px;transition:background .2s;
-        background:${f===currentIdentityFile?'var(--md-secondary-container)':'transparent'};
-        color:${f===currentIdentityFile?'var(--md-on-secondary-container)':'var(--md-on-surface)'}`;
-      el.textContent = f + (f===activeIdentityFile?' ✓':'');
+      const el=document.createElement('button');
+      el.type='button';
+      el.className='identity-file-item'+(f===currentIdentityFile?' active':'');
+      el.innerHTML = `<span class="identity-file-name">${esc(f)}</span>${f===activeIdentityFile?'<span class="identity-file-badge">当前</span>':''}`;
       el.onclick = ()=>{
         currentIdentityFile = f;
         loadIdentity();
@@ -498,6 +636,89 @@ window.openNewIdentityModal = function(){
   }
 };
 
+function fmtBytes(n){
+  if(n==null) return '—';
+  if(n < 1024) return `${n} B`;
+  if(n < 1024*1024) return `${(n/1024).toFixed(1)} KB`;
+  return `${(n/1024/1024).toFixed(2)} MB`;
+}
+
+function fmtUnix(ts){
+  if(!ts) return '—';
+  return new Date(ts*1000).toLocaleString('zh-CN',{hour12:false});
+}
+
+function stopContextAutoRefresh(){
+  if(contextAutoRefreshTimer){
+    clearInterval(contextAutoRefreshTimer);
+    contextAutoRefreshTimer = null;
+  }
+}
+
+function startContextAutoRefresh(){
+  stopContextAutoRefresh();
+  contextAutoRefreshTimer = setInterval(()=>{
+    if(currentTab==='context-files') loadContextFiles();
+  }, 5000);
+}
+
+window.toggleContextAutoRefresh = function(enabled){
+  contextAutoRefreshEnabled = !!enabled;
+  if(contextAutoRefreshEnabled && currentTab==='context-files') startContextAutoRefresh();
+  else stopContextAutoRefresh();
+};
+
+window.refreshContextFiles = function(){ loadContextFiles(); };
+
+window.copyCurrentContextFile = async function(){
+  const text = document.getElementById('context-file-content')?.textContent || '';
+  if(!text) return;
+  try{
+    await navigator.clipboard.writeText(text);
+    alert('已复制到剪贴板');
+  }catch(e){
+    alert('复制失败，请手动复制');
+  }
+};
+
+async function loadContextFiles(){
+  try{
+    const query = currentContextFile ? `?file=${encodeURIComponent(currentContextFile)}` : '';
+    const r = await fetch('/api/context-files'+query);
+    if(!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    currentContextFile = d.selected || currentContextFile;
+
+    const list = document.getElementById('context-files-list');
+    list.innerHTML = '';
+    for(const f of (d.files||[])){
+      const item = document.createElement('button');
+      item.className = 'context-file-item'+(f.id===d.selected?' active':'');
+      const badges = [f.active_in_prompt ? '注入中' : '未注入', f.exists ? '存在' : '缺失', f.is_virtual ? '虚拟' : '文件'];
+      item.innerHTML = `<div>${esc(f.label)}</div><div class="context-file-sub">${esc(f.path)} · ${badges.join(' / ')}</div>`;
+      item.onclick = ()=>{ currentContextFile = f.id; loadContextFiles(); };
+      list.appendChild(item);
+    }
+
+    const selectedMeta = (d.files||[]).find(f=>f.id===d.selected);
+    document.getElementById('context-selected-name').textContent = selectedMeta ? selectedMeta.label : '未选择文件';
+    document.getElementById('context-selected-meta').textContent = selectedMeta
+      ? `${selectedMeta.path} · ${selectedMeta.exists?'存在':'缺失'} · ${fmtBytes(selectedMeta.size_bytes)} · 修改时间 ${fmtUnix(selectedMeta.modified_unix)}`
+      : '—';
+    document.getElementById('context-mode').textContent = d.mode==='aieos' ? 'AIEOS' : 'OpenClaw';
+    document.getElementById('context-file-content').textContent = d.content || '';
+
+    const notes = document.getElementById('context-notes');
+    notes.innerHTML = (d.notes||[]).map(n=>`<div class="context-note">${esc(n)}</div>`).join('');
+
+    const autoRefresh = document.getElementById('context-auto-refresh');
+    if(autoRefresh) autoRefresh.checked = contextAutoRefreshEnabled;
+  }catch(e){
+    const content = document.getElementById('context-file-content');
+    if(content) content.textContent = `加载失败: ${e.message||e}`;
+  }
+}
+
 async function loadCron(){
   const box=document.getElementById('cron-list');
   try{
@@ -507,7 +728,7 @@ async function loadCron(){
     const jobs=d.jobs||[];
     box.innerHTML='';
     if(jobs.length===0){
-      box.innerHTML='<div class="empty-state" style="padding:32px 0"><span class="material-symbols-outlined">event_busy</span><p>暂无定时任务</p></div>';
+      box.innerHTML='<div class="empty-state roomy"><span class="material-symbols-outlined">event_busy</span><p>暂无定时任务</p></div>';
       return;
     }
     for(const j of jobs){
@@ -516,13 +737,13 @@ async function loadCron(){
       el.innerHTML=`
         <div class="expandable-header">
           <div class="expandable-icon"><span class="material-symbols-outlined">schedule</span></div>
-          <div style="flex:1;min-width:0">
+          <div class="expandable-main">
             <div class="expandable-title">${esc(j.expression)}</div>
             <div class="expandable-subtitle">$ ${esc(j.command||j.prompt||'')}</div>
           </div>
-          <div style="font-size:12px;color:${j.enabled?'#1B7A1B':'var(--md-error)'}">${j.enabled?'已启用':'已禁用'}</div>
-          <button class="btn btn-text" style="padding:0 12px;margin:0 8px" onclick="toggleCron('${j.id}', ${!j.enabled})">${j.enabled?'禁用':'启用'}</button>
-          <button class="btn btn-error" style="padding:0 12px" onclick="deleteCron('${j.id}')">删除</button>
+          <div class="cron-status ${j.enabled?'enabled':'disabled'}">${j.enabled?'已启用':'已禁用'}</div>
+          <button class="btn btn-text btn-sm" onclick="toggleCron('${j.id}', ${!j.enabled})">${j.enabled?'禁用':'启用'}</button>
+          <button class="btn btn-error btn-sm" onclick="deleteCron('${j.id}')">删除</button>
         </div>
       `;
       box.appendChild(el);
@@ -550,8 +771,9 @@ window.openCronAddModal = function(){
 window.serviceCmd = async function(action){
   try{
     const r=await fetch('/api/service',{method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({action})});
+    const d=await r.json().catch(()=>({}));
     if(r.ok) alert('执行成功 ('+action+')');
-    else alert('执行失败，请检查终端日志或权限');
+    else alert('执行失败: '+(d.error||'请检查终端日志或权限'));
   }catch(e){alert('网络错误')}
 };
 

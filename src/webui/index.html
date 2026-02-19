@@ -44,6 +44,12 @@
     <span class="nav-label-expanded">模型与路由</span>
   </button>
 
+  <button class="nav-item" onclick="switchTab('context-files')">
+    <span class="indicator"><span class="material-symbols-outlined">description</span></span>
+    <span class="nav-label">上下文</span>
+    <span class="nav-label-expanded">上下文文件</span>
+  </button>
+
   <button class="nav-item" onclick="switchTab('cron')">
     <span class="indicator"><span class="material-symbols-outlined">schedule</span></span>
     <span class="nav-label">定时</span>
@@ -68,7 +74,7 @@
 <div class="main-area">
 
   <header class="top-app-bar">
-    <span class="headline" id="page-title" style="font-weight:500">仪表盘</span>
+    <span class="headline page-headline" id="page-title">仪表盘</span>
     <button class="trailing-icon" onclick="refreshCurrent()" title="刷新">
       <span class="material-symbols-outlined">refresh</span>
     </button>
@@ -125,11 +131,16 @@
             <span class="material-symbols-outlined">thermostat</span>
             <div><div class="info-label">温度</div><div class="info-value" id="v-temp">—</div></div>
           </div>
+           <div class="info-item">
+            <span class="material-symbols-outlined">target</span>
+            <div><div class="info-label">配置默认模型</div><div class="info-value" id="v-config-model">—</div></div>
+          </div>
           <div class="info-item">
             <span class="material-symbols-outlined">tune</span>
             <div><div class="info-label">自主等级</div><div class="info-value" id="v-autonomy">—</div></div>
           </div>
         </div>
+        <div class="inline-alert is-hidden" id="v-model-alert">检测到“运行模型”与“配置模型”不一致：保存配置后需要重启 daemon/channels 才会完全生效。</div>
       </div>
 
       <div class="card">
@@ -200,14 +211,16 @@
       <div class="card">
         <div class="card-header">
           <div class="icon-circle"><span class="material-symbols-outlined">hub</span></div>
-          <div>
+          <div class="header-main">
             <span class="card-title">消息平台 (Channels)</span>
             <div class="card-subtitle">点击平台展开详细配置，右上角开关可随时启停</div>
           </div>
-          <button class="btn btn-fill" onclick="saveRawConfig()">保存所有平台更改</button>
+          <div class="header-actions">
+            <button class="btn btn-fill" onclick="saveRawConfig()">保存所有平台更改</button>
+          </div>
         </div>
         <div id="channels-list">
-          <div class="empty-state" style="padding:32px 0">
+          <div class="empty-state compact">
             <span class="material-symbols-outlined">hourglass_empty</span>
             <p>正在拉取原始配置…</p>
           </div>
@@ -221,12 +234,14 @@
       <div class="card">
         <div class="card-header">
           <div class="icon-circle"><span class="material-symbols-outlined">model_training</span></div>
-          <div style="flex:1">
+          <div class="header-main">
             <span class="card-title">全局模型提供商</span>
             <div class="card-subtitle">设置默认的 AI 模型供应端点和密钥</div>
           </div>
-          <button class="btn btn-text" onclick="addCustomProvider()">+ 添加自定义</button>
-          <button class="btn btn-fill" onclick="saveRawConfig()">保存配置</button>
+          <div class="header-actions">
+            <button class="btn btn-text" onclick="addCustomProvider()">+ 添加自定义</button>
+            <button class="btn btn-fill" onclick="saveRawConfig()">保存配置</button>
+          </div>
         </div>
         <div id="providers-list"></div>
       </div>
@@ -234,11 +249,13 @@
       <div class="card">
         <div class="card-header">
           <div class="icon-circle"><span class="material-symbols-outlined">route</span></div>
-          <div style="flex:1">
+          <div class="header-main">
             <span class="card-title">模型路由 (Model Routes)</span>
             <div class="card-subtitle">根据特定的 Hint (如 reasoning, fast, code) 路由到指定的模型</div>
           </div>
-          <button class="btn btn-text" onclick="addModelRoute()">+ 添加路由规则</button>
+          <div class="header-actions">
+            <button class="btn btn-text" onclick="addModelRoute()">+ 添加路由规则</button>
+          </div>
         </div>
         <div id="model-routes-list"></div>
       </div>
@@ -248,10 +265,10 @@
   <main id="page-config" class="page">
     <div class="dashboard" id="config-content">
       <div class="card">
-        <div class="card-header" style="position:sticky;top:64px;background:var(--md-surface-container-lowest);z-index:2;margin:-16px -16px 16px -16px;padding:16px;border-bottom:1px solid var(--md-outline-variant);border-radius:var(--md-corner-m) var(--md-corner-m) 0 0">
+        <div class="card-header sticky-header">
           <div class="icon-circle"><span class="material-symbols-outlined">tune</span></div>
-          <span class="card-title" style="flex:1">所有底层配置</span>
-          <button class="btn btn-fill" onclick="saveRawConfig()">保存全部高级配置</button>
+          <div class="header-main"><span class="card-title">所有底层配置</span></div>
+          <div class="header-actions"><button class="btn btn-fill" onclick="saveRawConfig()">保存全部高级配置</button></div>
         </div>
         <div id="raw-config-forms"></div>
       </div>
@@ -259,33 +276,75 @@
   </main>
 
   <main id="page-identity" class="page">
-    <div class="dashboard" style="display:flex;gap:16px;height:100%;align-items:stretch">
-      <div class="card" style="width:240px;display:flex;flex-direction:column;gap:8px">
-        <div class="card-header" style="margin-bottom:0">
+    <div class="dashboard identity-layout">
+      <div class="card identity-sidebar">
+        <div class="card-header compact-header">
           <span class="card-title">身份列表</span>
         </div>
-        <div style="display:flex;flex-direction:column;gap:4px;flex:1;overflow-y:auto" id="identity-file-list">
+        <div class="identity-file-list" id="identity-file-list">
         </div>
-        <button class="btn btn-text" style="width:100%;justify-content:center;display:flex" onclick="openNewIdentityModal()">
-          <span class="material-symbols-outlined" style="font-size:18px;margin-right:4px">add</span> 新建身份
+        <button class="btn btn-text identity-add-btn" onclick="openNewIdentityModal()">
+          <span class="material-symbols-outlined icon-leading-sm">add</span> 新建身份
         </button>
       </div>
 
-      <div class="card" style="flex:1;display:flex;flex-direction:column">
-        <div class="card-header" style="margin-bottom:8px">
+      <div class="card identity-editor">
+        <div class="card-header compact-header">
           <div class="icon-circle"><span class="material-symbols-outlined">badge</span></div>
-          <div style="flex:1;min-width:0">
+          <div class="header-main">
             <span class="card-title" id="identity-title-disp">身份与行为准则</span>
             <div class="card-subtitle">支持 Markdown (.md) 纯文本或 AIEOS (.json) 标准格式。</div>
           </div>
-          <div style="display:flex;gap:8px">
+          <div class="identity-actions">
             <button class="btn btn-text" id="btn-activate-identity" onclick="activateIdentity()">设为当前使用</button>
             <button class="btn btn-fill" id="btn-save-identity" onclick="saveIdentity()">保存修改</button>
           </div>
         </div>
-        <div class="text-field" style="flex:1;display:flex;flex-direction:column">
-          <textarea id="identity-input" style="flex:1;min-height:300px;font-family:monospace;resize:none"
+        <div class="text-field identity-text-field">
+          <textarea id="identity-input" class="identity-textarea"
             placeholder="没有内容。开始输入..."></textarea>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <main id="page-context-files" class="page">
+    <div class="dashboard">
+      <div class="card">
+        <div class="card-header">
+          <div class="icon-circle"><span class="material-symbols-outlined">description</span></div>
+          <div class="header-main">
+            <span class="card-title">自动更新上下文文件</span>
+            <div class="card-subtitle">查看 SOUL / IDENTITY / AIEOS 等会影响系统提示词注入的当前内容</div>
+          </div>
+          <label class="inline-toggle-label">
+            <input type="checkbox" id="context-auto-refresh" onchange="toggleContextAutoRefresh(this.checked)">
+            自动刷新 (5s)
+          </label>
+          <div class="header-actions">
+            <button class="btn btn-text" onclick="refreshContextFiles()">刷新内容</button>
+          </div>
+        </div>
+
+        <div class="context-files-layout">
+          <aside class="context-files-sidebar" id="context-files-list">
+            <div class="empty-state compact"><p>加载中…</p></div>
+          </aside>
+
+          <section class="context-files-content">
+            <div class="context-files-toolbar">
+              <div class="header-main">
+                <div class="context-title" id="context-selected-name">未选择文件</div>
+                <div class="context-meta" id="context-selected-meta">—</div>
+              </div>
+              <div class="context-toolbar-actions">
+                <span class="chip" id="context-mode-chip">模式: <span id="context-mode">—</span></span>
+                <button class="btn btn-text" onclick="copyCurrentContextFile()">复制内容</button>
+              </div>
+            </div>
+            <pre class="context-file-content" id="context-file-content"></pre>
+            <div class="context-notes" id="context-notes"></div>
+          </section>
         </div>
       </div>
     </div>
@@ -296,14 +355,16 @@
       <div class="card">
         <div class="card-header">
           <div class="icon-circle"><span class="material-symbols-outlined">schedule</span></div>
-          <div style="flex:1">
+          <div class="header-main">
             <span class="card-title">定时任务 (Cron/Scheduler)</span>
             <div class="card-subtitle">管理和调度自动化执行的 Shell 脚本或 Agent 会话。</div>
           </div>
-          <button class="btn btn-fill" onclick="openCronAddModal()">+ 新建任务</button>
+          <div class="header-actions">
+            <button class="btn btn-fill" onclick="openCronAddModal()">+ 新建任务</button>
+          </div>
         </div>
-        <div style="display:flex;flex-direction:column;gap:10px" id="cron-list">
-          <div class="empty-state" style="padding:32px 0"><p>正在加载…</p></div>
+        <div class="cron-list" id="cron-list">
+          <div class="empty-state roomy"><p>正在加载…</p></div>
         </div>
       </div>
     </div>
@@ -316,16 +377,17 @@
           <div class="icon-circle"><span class="material-symbols-outlined">settings</span></div>
           <span class="card-title">设置</span>
         </div>
-        <div style="padding:16px 0;color:var(--md-on-surface-variant);font:400 14px/20px system-ui,sans-serif">
-          <p style="margin-bottom:16px">大部分配置请通过 <code style="background:var(--md-surface-container-high);padding:2px 6px;border-radius:4px">config.toml</code> 编辑，或使用 <code style="background:var(--md-surface-container-high);padding:2px 6px;border-radius:4px">zeroclaw onboard --interactive</code> 交互式向导。</p>
-          <div style="border:1px solid var(--md-outline-variant);border-radius:var(--md-corner-s);padding:16px">
-            <div style="font-weight:500;color:var(--md-on-surface);margin-bottom:8px;font-size:16px">系统守护进程 (Daemon Service)</div>
-            <p style="font-size:13px;margin-bottom:16px">将 ZeroClaw 注册为开机自启的后台服务 (支持 systemd/launchd/schtasks)</p>
-            <div style="display:flex;gap:8px">
+        <div class="settings-content">
+          <p class="settings-tip">大部分配置请通过 <code>config.toml</code> 编辑，或使用 <code>zeroclaw onboard --interactive</code> 交互式向导。</p>
+          <div class="settings-service-box">
+            <div class="settings-service-title">系统守护进程 (Daemon Service)</div>
+            <p class="settings-service-desc">将 ZeroClaw 注册为开机自启的后台服务 (支持 systemd/launchd/schtasks)</p>
+            <div class="service-actions">
               <button class="btn btn-fill" onclick="serviceCmd('install')">注册并安装服务</button>
-              <button class="btn btn-fill" style="background:var(--md-secondary)" onclick="serviceCmd('start')">启动服务</button>
+              <button class="btn btn-fill btn-secondary" onclick="serviceCmd('start')">启动服务</button>
               <button class="btn btn-error" onclick="serviceCmd('stop')">停止</button>
-              <button class="btn btn-error" style="background:transparent;color:var(--md-error);border:1px solid var(--md-error)" onclick="serviceCmd('uninstall')">卸载服务</button>
+              <button class="btn btn-text" onclick="serviceCmd('status')">查看状态</button>
+              <button class="btn btn-outline-error" onclick="serviceCmd('uninstall')">卸载服务</button>
             </div>
           </div>
         </div>

@@ -41,6 +41,7 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::PathBuf;
@@ -84,6 +85,19 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
             "When responding on Telegram, include media markers for files or URLs that should be sent as attachments. Use one marker per attachment with this exact syntax: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]. Keep normal user-facing text outside markers and never wrap markers in code fences.",
         ),
         _ => None,
+    }
+}
+
+fn compose_system_prompt_for_channel<'a>(base_prompt: &'a str, channel_name: &str) -> Cow<'a, str> {
+    match channel_delivery_instructions(channel_name) {
+        Some(instructions) => {
+            let mut merged = String::with_capacity(base_prompt.len() + instructions.len() + 64);
+            merged.push_str(base_prompt);
+            merged.push_str("\n\n## Channel Delivery\n\n");
+            merged.push_str(instructions);
+            Cow::Owned(merged)
+        }
+        None => Cow::Borrowed(base_prompt),
     }
 }
 
@@ -198,14 +212,12 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
 
+    let system_prompt = compose_system_prompt_for_channel(ctx.system_prompt.as_str(), &msg.channel);
+
     let mut history = vec![
-        ChatMessage::system(ctx.system_prompt.as_str()),
+        ChatMessage::system(system_prompt.as_ref()),
         ChatMessage::user(&enriched_message),
     ];
-
-    if let Some(instructions) = channel_delivery_instructions(&msg.channel) {
-        history.push(ChatMessage::system(instructions));
-    }
 
     let llm_result = tokio::time::timeout(
         Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
@@ -520,9 +532,9 @@ pub fn build_system_prompt(
     // ── 8. Channel Capabilities ─────────────────────────────────────
     prompt.push_str("## Channel Capabilities\n\n");
     prompt.push_str(
-        "- You are running as a Discord bot. You CAN and do send messages to Discord channels.\n",
+        "- You are running in ZeroClaw channel mode. Replies are delivered automatically to the originating channel (Telegram/Discord/Slack/etc.).\n",
     );
-    prompt.push_str("- When someone messages you on Discord, your response is automatically sent back to Discord.\n");
+    prompt.push_str("- When someone messages you on a channel, your response is sent back there automatically.\n");
     prompt.push_str("- You do NOT need to ask permission to respond — just respond directly.\n");
     prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
     prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n\n");
@@ -1215,6 +1227,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     println!("🦀 ZeroClaw Channel Server");
     println!("  🤖 Model:    {model}");
+    println!("  📂 Workspace: {}", workspace.display());
     println!(
         "  🧠 Memory:   {} (auto-save: {})",
         config.memory.backend,
@@ -1899,13 +1912,31 @@ mod tests {
             "missing Channel Capabilities section"
         );
         assert!(
-            prompt.contains("running as a Discord bot"),
-            "missing Discord context"
+            prompt.contains("running in ZeroClaw channel mode"),
+            "missing generic channel context"
         );
         assert!(
             prompt.contains("NEVER repeat, describe, or echo credentials"),
             "missing security instruction"
         );
+    }
+
+    #[test]
+    fn compose_system_prompt_for_telegram_adds_delivery_block() {
+        let base = "You are ZeroClaw.";
+        let merged = compose_system_prompt_for_channel(base, "telegram");
+
+        assert!(merged.contains(base));
+        assert!(merged.contains("## Channel Delivery"));
+        assert!(merged.contains("When responding on Telegram"));
+    }
+
+    #[test]
+    fn compose_system_prompt_for_non_telegram_keeps_base_prompt() {
+        let base = "You are ZeroClaw.";
+        let merged = compose_system_prompt_for_channel(base, "discord");
+
+        assert_eq!(merged.as_ref(), base);
     }
 
     #[test]
