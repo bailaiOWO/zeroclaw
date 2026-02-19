@@ -1321,6 +1321,7 @@ pub struct ChannelsConfig {
     pub lark: Option<LarkConfig>,
     pub dingtalk: Option<DingTalkConfig>,
     pub qq: Option<QQConfig>,
+    pub onebot_v11: Option<OneBotV11Config>,
 }
 
 impl Default for ChannelsConfig {
@@ -1341,6 +1342,7 @@ impl Default for ChannelsConfig {
             lark: None,
             dingtalk: None,
             qq: None,
+            onebot_v11: None,
         }
     }
 }
@@ -1693,6 +1695,44 @@ pub struct QQConfig {
     pub allowed_users: Vec<String>,
 }
 
+/// OneBot v11 configuration (NapCat / go-cqhttp compatible).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OneBotV11Config {
+    /// Base API URL for calling OneBot actions, e.g. "http://127.0.0.1:3000".
+    pub api_url: String,
+    /// Optional OneBot access token.
+    /// Used for Authorization/X-Access-Token, and for NapCat HTTP Client `X-Signature` verification.
+    #[serde(default)]
+    pub access_token: Option<String>,
+    /// Local host/IP used by ZeroClaw to receive OneBot callbacks.
+    #[serde(default = "default_onebot_listen_host")]
+    pub listen_host: String,
+    /// Local port used by ZeroClaw to receive OneBot callbacks.
+    #[serde(default = "default_onebot_listen_port")]
+    pub listen_port: u16,
+    /// Allowed user IDs (string form). Empty = deny all, "*" = allow all.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Allowed group IDs (string form). Empty = allow all, "*" = allow all.
+    #[serde(default)]
+    pub allowed_groups: Vec<String>,
+    /// In group chats, require @mention (or to_me) before forwarding messages.
+    #[serde(default = "default_onebot_require_at_in_group")]
+    pub require_at_in_group: bool,
+}
+
+fn default_onebot_listen_host() -> String {
+    "0.0.0.0".to_string()
+}
+
+fn default_onebot_listen_port() -> u16 {
+    8096
+}
+
+fn default_onebot_require_at_in_group() -> bool {
+    true
+}
+
 // ── Config impl ──────────────────────────────────────────────────
 
 impl Default for Config {
@@ -1976,6 +2016,14 @@ impl Config {
                 "config.browser.computer_use.api_key",
             )?;
 
+            if let Some(onebot) = config.channels_config.onebot_v11.as_mut() {
+                decrypt_optional_secret(
+                    &store,
+                    &mut onebot.access_token,
+                    "config.channels_config.onebot_v11.access_token",
+                )?;
+            }
+
             for agent in config.agents.values_mut() {
                 decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
             }
@@ -2101,6 +2149,14 @@ impl Config {
             &mut config_to_save.browser.computer_use.api_key,
             "config.browser.computer_use.api_key",
         )?;
+
+        if let Some(onebot) = config_to_save.channels_config.onebot_v11.as_mut() {
+            encrypt_optional_secret(
+                &store,
+                &mut onebot.access_token,
+                "config.channels_config.onebot_v11.access_token",
+            )?;
+        }
 
         for agent in config_to_save.agents.values_mut() {
             encrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
@@ -2295,6 +2351,7 @@ default_temperature = 0.7
         assert!(c.cli);
         assert!(c.telegram.is_none());
         assert!(c.discord.is_none());
+        assert!(c.onebot_v11.is_none());
     }
 
     // ── Serde round-trip ─────────────────────────────────────
@@ -2356,6 +2413,7 @@ default_temperature = 0.7
                 lark: None,
                 dingtalk: None,
                 qq: None,
+                onebot_v11: None,
             },
             memory: MemoryConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -2772,6 +2830,7 @@ tool_dispatcher = "xml"
             lark: None,
             dingtalk: None,
             qq: None,
+            onebot_v11: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -2935,6 +2994,7 @@ channel_id = "C123"
             lark: None,
             dingtalk: None,
             qq: None,
+            onebot_v11: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -3772,6 +3832,40 @@ default_model = "legacy-model"
         let json = r#"{"app_id":"cli_123","app_secret":"secret","allowed_users":["*"]}"#;
         let parsed: LarkConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.allowed_users, vec!["*"]);
+    }
+
+    #[test]
+    fn onebot_v11_config_toml_defaults() {
+        let toml_str = r#"
+api_url = "http://127.0.0.1:3000"
+"#;
+        let parsed: OneBotV11Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.api_url, "http://127.0.0.1:3000");
+        assert!(parsed.access_token.is_none());
+        assert_eq!(parsed.listen_host, "0.0.0.0");
+        assert_eq!(parsed.listen_port, 8096);
+        assert!(parsed.allowed_users.is_empty());
+        assert!(parsed.allowed_groups.is_empty());
+        assert!(parsed.require_at_in_group);
+    }
+
+    #[test]
+    fn onebot_v11_config_roundtrip() {
+        let cfg = OneBotV11Config {
+            api_url: "http://127.0.0.1:3000".into(),
+            access_token: Some("token_abc".into()),
+            listen_host: "127.0.0.1".into(),
+            listen_port: 18080,
+            allowed_users: vec!["10001".into(), "*".into()],
+            allowed_groups: vec!["20001".into()],
+            require_at_in_group: false,
+        };
+        let toml = toml::to_string(&cfg).unwrap();
+        let parsed: OneBotV11Config = toml::from_str(&toml).unwrap();
+        assert_eq!(parsed.listen_host, "127.0.0.1");
+        assert_eq!(parsed.listen_port, 18080);
+        assert_eq!(parsed.allowed_groups, vec!["20001"]);
+        assert!(!parsed.require_at_in_group);
     }
 
     // ── Config file permission hardening (Unix only) ───────────────

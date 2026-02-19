@@ -1,4 +1,4 @@
-use crate::config::schema::{DingTalkConfig, IrcConfig, QQConfig, WhatsAppConfig};
+use crate::config::schema::{DingTalkConfig, IrcConfig, OneBotV11Config, QQConfig, WhatsAppConfig};
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
     HeartbeatConfig, IMessageConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
@@ -164,7 +164,8 @@ pub fn run_wizard() -> Result<Config> {
         || config.channels_config.matrix.is_some()
         || config.channels_config.email.is_some()
         || config.channels_config.dingtalk.is_some()
-        || config.channels_config.qq.is_some();
+        || config.channels_config.qq.is_some()
+        || config.channels_config.onebot_v11.is_some();
 
     if has_channels && config.api_key.is_some() {
         let launch: bool = Confirm::new()
@@ -223,7 +224,8 @@ pub fn run_channels_repair_wizard() -> Result<Config> {
         || config.channels_config.matrix.is_some()
         || config.channels_config.email.is_some()
         || config.channels_config.dingtalk.is_some()
-        || config.channels_config.qq.is_some();
+        || config.channels_config.qq.is_some()
+        || config.channels_config.onebot_v11.is_some();
 
     if has_channels && config.api_key.is_some() {
         let launch: bool = Confirm::new()
@@ -2459,6 +2461,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         lark: None,
         dingtalk: None,
         qq: None,
+        onebot_v11: None,
     };
 
     loop {
@@ -2543,13 +2546,21 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     "— Tencent QQ Bot"
                 }
             ),
+            format!(
+                "NapCat/OneBot v11 {}",
+                if config.onebot_v11.is_some() {
+                    "✅ connected"
+                } else {
+                    "— OneBot v11 (NapCat/go-cqhttp)"
+                }
+            ),
             "Done — finish setup".to_string(),
         ];
 
         let choice = Select::new()
             .with_prompt("  Connect a channel (or Done to continue)")
             .items(&options)
-            .default(10)
+            .default(11)
             .interact()?;
 
         match choice {
@@ -3407,6 +3418,104 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                 });
             }
+            10 => {
+                // ── NapCat / OneBot v11 ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("NapCat / OneBot v11 Setup").white().bold(),
+                    style("— OneBot v11 HTTP callback + API").dim()
+                );
+                print_bullet("1. 在 NapCat 中启用 OneBot v11 HTTP API（正向）");
+                print_bullet(
+                    "2. 将事件上报地址设置为: http://<zeroclaw-host>:<listen_port>/onebot/v11",
+                );
+                print_bullet("3. 如果配置 access_token，NapCat 与 ZeroClaw 需保持一致");
+                println!();
+
+                let api_url: String = Input::new()
+                    .with_prompt("  OneBot API 地址 (如 http://127.0.0.1:3000)")
+                    .default("http://127.0.0.1:3000".into())
+                    .interact_text()?;
+
+                if api_url.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
+                    continue;
+                }
+
+                let access_token: String = Input::new()
+                    .with_prompt("  Access Token (可选，留空跳过)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let listen_host: String = Input::new()
+                    .with_prompt("  回调监听地址")
+                    .default("0.0.0.0".into())
+                    .interact_text()?;
+
+                let listen_port_raw: String = Input::new()
+                    .with_prompt("  回调监听端口")
+                    .default("8096".into())
+                    .interact_text()?;
+                let listen_port: u16 = listen_port_raw.trim().parse().unwrap_or(8096);
+
+                print!("  {} Testing API... ", style("⏳").dim());
+                let client = reqwest::blocking::Client::new();
+                let mut req = client
+                    .post(format!("{}/get_login_info", api_url.trim_end_matches('/')))
+                    .json(&serde_json::json!({}));
+                if !access_token.trim().is_empty() {
+                    req = req.header("Authorization", format!("Bearer {}", access_token.trim()));
+                }
+                match req.send() {
+                    Ok(resp) if resp.status().is_success() => println!(
+                        "\r  {} OneBot API reachable        ",
+                        style("✅").green().bold()
+                    ),
+                    _ => {
+                        println!(
+                            "\r  {} API connection failed — check URL/token",
+                            style("❌").red().bold()
+                        );
+                        continue;
+                    }
+                }
+
+                let users_str: String = Input::new()
+                    .with_prompt("  Allowed user IDs (comma-separated, '*' for all)")
+                    .allow_empty(true)
+                    .interact_text()?;
+                let groups_str: String = Input::new()
+                    .with_prompt("  Allowed group IDs (comma-separated, 留空=全部)")
+                    .allow_empty(true)
+                    .interact_text()?;
+                let require_at_in_group = Confirm::new()
+                    .with_prompt("  群聊仅在 @机器人 时触发?")
+                    .default(true)
+                    .interact()?;
+
+                config.onebot_v11 = Some(OneBotV11Config {
+                    api_url: api_url.trim_end_matches('/').to_string(),
+                    access_token: if access_token.trim().is_empty() {
+                        None
+                    } else {
+                        Some(access_token.trim().to_string())
+                    },
+                    listen_host: listen_host.trim().to_string(),
+                    listen_port,
+                    allowed_users: users_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                    allowed_groups: groups_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                    require_at_in_group,
+                });
+            }
             _ => break, // Done
         }
         println!();
@@ -3446,6 +3555,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
     }
     if config.qq.is_some() {
         active.push("QQ");
+    }
+    if config.onebot_v11.is_some() {
+        active.push("OneBot v11");
     }
 
     println!(
@@ -3899,7 +4011,8 @@ fn print_summary(config: &Config) {
         || config.channels_config.matrix.is_some()
         || config.channels_config.email.is_some()
         || config.channels_config.dingtalk.is_some()
-        || config.channels_config.qq.is_some();
+        || config.channels_config.qq.is_some()
+        || config.channels_config.onebot_v11.is_some();
 
     println!();
     println!(
@@ -3966,6 +4079,15 @@ fn print_summary(config: &Config) {
     }
     if config.channels_config.webhook.is_some() {
         channels.push("Webhook");
+    }
+    if config.channels_config.dingtalk.is_some() {
+        channels.push("DingTalk");
+    }
+    if config.channels_config.qq.is_some() {
+        channels.push("QQ Official");
+    }
+    if config.channels_config.onebot_v11.is_some() {
+        channels.push("OneBot v11");
     }
     println!(
         "    {} Channels:      {}",

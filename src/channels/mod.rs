@@ -7,6 +7,7 @@ pub mod irc;
 pub mod lark;
 pub mod matrix;
 pub mod mattermost;
+pub mod onebot_v11;
 pub mod qq;
 pub mod signal;
 pub mod slack;
@@ -23,6 +24,7 @@ pub use irc::IrcChannel;
 pub use lark::LarkChannel;
 pub use matrix::MatrixChannel;
 pub use mattermost::MattermostChannel;
+pub use onebot_v11::OneBotV11Channel;
 pub use qq::QQChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
@@ -746,6 +748,7 @@ pub fn handle_command(command: crate::ChannelCommands, config: &Config) -> Resul
                 ("Lark", config.channels_config.lark.is_some()),
                 ("DingTalk", config.channels_config.dingtalk.is_some()),
                 ("QQ", config.channels_config.qq.is_some()),
+                ("OneBot v11", config.channels_config.onebot_v11.is_some()),
             ] {
                 println!("  {} {name}", if configured { "✅" } else { "❌" });
             }
@@ -916,6 +919,13 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 qq.app_secret.clone(),
                 qq.allowed_users.clone(),
             )),
+        ));
+    }
+
+    if let Some(ref onebot) = config.channels_config.onebot_v11 {
+        channels.push((
+            "OneBot v11",
+            Arc::new(OneBotV11Channel::new(onebot.clone())),
         ));
     }
 
@@ -1218,6 +1228,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
             qq.app_secret.clone(),
             qq.allowed_users.clone(),
         )));
+    }
+
+    if let Some(ref onebot) = config.channels_config.onebot_v11 {
+        channels.push(Arc::new(OneBotV11Channel::new(onebot.clone())));
     }
 
     if channels.is_empty() {

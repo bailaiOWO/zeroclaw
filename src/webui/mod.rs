@@ -46,6 +46,8 @@ pub async fn handle_api_status(State(state): State<AppState>) -> impl IntoRespon
         "slack": config.channels_config.slack.is_some(),
         "webhook": config.channels_config.webhook.is_some(),
         "whatsapp": config.channels_config.whatsapp.is_some(),
+        "qq": config.channels_config.qq.is_some(),
+        "onebot_v11": config.channels_config.onebot_v11.is_some(),
     });
 
     let configured_model = config.default_model.as_deref().unwrap_or("");
@@ -79,6 +81,15 @@ pub async fn handle_api_status(State(state): State<AppState>) -> impl IntoRespon
 /// Secrets are masked (only `has_*` booleans exposed), counts replace lists.
 pub async fn handle_api_config(State(state): State<AppState>) -> impl IntoResponse {
     let config = state.config.lock();
+
+    let onebot_v11_summary = config.channels_config.onebot_v11.as_ref().map(|o| {
+        serde_json::json!({
+            "api_url": &o.api_url,
+            "listen_host": &o.listen_host,
+            "listen_port": o.listen_port,
+            "allowed_users": o.allowed_users.len(),
+        })
+    });
 
     let body = serde_json::json!({
         "core": {
@@ -266,6 +277,7 @@ pub async fn handle_api_config(State(state): State<AppState>) -> impl IntoRespon
             "qq": config.channels_config.qq.as_ref().map(|q| serde_json::json!({
                 "allowed_users": q.allowed_users.len(),
             })),
+            "onebot_v11": onebot_v11_summary,
         },
     });
 
@@ -854,6 +866,7 @@ pub async fn handle_api_config_mutate(
             "discord" => config.channels_config.discord = None,
             "qq" => config.channels_config.qq = None,
             "webhook" => config.channels_config.webhook = None,
+            "onebot_v11" => config.channels_config.onebot_v11 = None,
             _ => {}
         },
     }

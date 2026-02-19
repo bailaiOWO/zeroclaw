@@ -614,6 +614,8 @@ async fn main() -> Result<()> {
                 ("Discord", config.channels_config.discord.is_some()),
                 ("Slack", config.channels_config.slack.is_some()),
                 ("Webhook", config.channels_config.webhook.is_some()),
+                ("QQ Official", config.channels_config.qq.is_some()),
+                ("OneBot v11", config.channels_config.onebot_v11.is_some()),
             ] {
                 println!(
                     "  {name:9} {}",

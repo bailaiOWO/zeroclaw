@@ -159,6 +159,18 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
                 }
             },
         },
+        IntegrationEntry {
+            name: "NapCat (OneBot v11)",
+            description: "NapCat / OneBot v11 HTTP callback + API",
+            category: IntegrationCategory::Chat,
+            status_fn: |c| {
+                if c.channels_config.onebot_v11.is_some() {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
         // ── AI Models ───────────────────────────────────────────
         IntegrationEntry {
             name: "OpenRouter",

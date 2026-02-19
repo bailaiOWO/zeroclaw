@@ -226,9 +226,13 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         || cc.imessage.is_some()
         || cc.matrix.is_some()
         || cc.whatsapp.is_some()
+        || cc.signal.is_some()
         || cc.email.is_some()
         || cc.irc.is_some()
         || cc.lark.is_some()
+        || cc.dingtalk.is_some()
+        || cc.qq.is_some()
+        || cc.onebot_v11.is_some()
         || cc.webhook.is_some();
 
     if has_channel {

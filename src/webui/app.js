@@ -96,8 +96,8 @@ async function loadStatus(){
     document.getElementById('v-paired').textContent=d.paired?'已配对':'未配对';
 
     const ch=d.channels||{};
-    const names={cli:'CLI',telegram:'Telegram',discord:'Discord',slack:'Slack',webhook:'Webhook',whatsapp:'WhatsApp'};
-    const icons={cli:'terminal',telegram:'send',discord:'headset_mic',slack:'tag',webhook:'webhook',whatsapp:'chat'};
+    const names={cli:'CLI',telegram:'Telegram',discord:'Discord',slack:'Slack',webhook:'Webhook',whatsapp:'WhatsApp',qq:'QQ Official',onebot_v11:'NapCat/OneBot v11'};
+    const icons={cli:'terminal',telegram:'send',discord:'headset_mic',slack:'tag',webhook:'webhook',whatsapp:'chat',qq:'smart_toy',onebot_v11:'hub'};
     const box=document.getElementById('channels-chips');
     box.innerHTML='';
     for(const[k,label] of Object.entries(names)){
@@ -145,6 +145,7 @@ const ALL_CHANNELS = [
   {key:'discord',  name:'Discord', icon:'headset_mic', desc:'Discord Bot', schema:{bot_token:'str',guild_id:'str',allowed_users:'arr',listen_to_bots:'bool',mention_only:'bool'}},
   {key:'slack',    name:'Slack', icon:'tag', desc:'Slack Bot', schema:{bot_token:'str',app_token:'str',channel_id:'str',allowed_users:'arr'}},
   {key:'qq',       name:'QQ Official', icon:'smart_toy', desc:'QQ 官方机器人', schema:{app_id:'str',app_secret:'str',allowed_users:'arr'}},
+  {key:'onebot_v11', name:'NapCat / OneBot v11', icon:'hub', desc:'NapCat 作为 OneBot v11 接入', schema:{api_url:'str',access_token:'str',listen_host:'str',listen_port:'num',allowed_users:'arr',allowed_groups:'arr',require_at_in_group:'bool'}},
   {key:'webhook',  name:'Webhook', icon:'webhook', desc:'HTTP 回调接口', schema:{port:'num',secret:'str'}},
   {key:'whatsapp', name:'WhatsApp', icon:'chat', desc:'Meta Business API', schema:{access_token:'str',phone_number_id:'str',verify_token:'str',app_secret:'str',allowed_numbers:'arr'}},
   {key:'lark',     name:'飞书 / Lark', icon:'apartment', desc:'飞书开放平台', schema:{app_id:'str',app_secret:'str',encrypt_key:'str',verification_token:'str',allowed_users:'arr',use_feishu:'bool',receive_mode:'str',port:'num'}},
@@ -152,7 +153,7 @@ const ALL_CHANNELS = [
   {key:'cli',      name:'CLI 终端', icon:'terminal', desc:'启用命令行交互通道', schema:{}},
 ];
 
-const CH_DICT = {bot_token:'机器人 Token', allowed_users:'授权用户ID (逗号分隔)', guild_id:'服务器 ID (Guild)', listen_to_bots:'监听其他机器人', mention_only:'仅响应@提及', app_token:'App Token', channel_id:'频道 ID', app_id:'应用 ID', app_secret:'应用密钥', port:'监听端口', secret:'密钥 (可选)', access_token:'访问令牌', phone_number_id:'电话号码ID', verify_token:'验证令牌', allowed_numbers:'授权电话号码', encrypt_key:'加密密钥', verification_token:'事件订阅Token', use_feishu:'使用飞书(而非Lark)', receive_mode:'接收模式(websocket/webhook)', client_id:'Client ID', client_secret:'Client Secret'};
+const CH_DICT = {bot_token:'机器人 Token', allowed_users:'授权用户ID (逗号分隔)', guild_id:'服务器 ID (Guild)', listen_to_bots:'监听其他机器人', mention_only:'仅响应@提及', app_token:'App Token', channel_id:'频道 ID', app_id:'应用 ID', app_secret:'应用密钥', port:'监听端口', secret:'密钥 (可选)', access_token:'访问令牌', phone_number_id:'电话号码ID', verify_token:'验证令牌', allowed_numbers:'授权电话号码', encrypt_key:'加密密钥', verification_token:'事件订阅Token', use_feishu:'使用飞书(而非Lark)', receive_mode:'接收模式(websocket/webhook)', client_id:'Client ID', client_secret:'Client Secret', api_url:'OneBot API 地址', listen_host:'回调监听地址', listen_port:'回调监听端口', allowed_groups:'授权群号 (逗号分隔，可空=全部)', require_at_in_group:'群聊仅响应@机器人'};
 
 
 function renderChannels(cfg){
@@ -219,6 +220,15 @@ window.toggleChannel = function(el, key, checked){
          if(key === 'webhook') {
              _rawConfig.channels_config.webhook.port = 8080;
          }
+         if(key === 'onebot_v11') {
+             _rawConfig.channels_config.onebot_v11.api_url = 'http://127.0.0.1:3000';
+             _rawConfig.channels_config.onebot_v11.listen_host = '0.0.0.0';
+             _rawConfig.channels_config.onebot_v11.listen_port = 8096;
+             _rawConfig.channels_config.onebot_v11.allowed_users = [];
+             _rawConfig.channels_config.onebot_v11.allowed_groups = [];
+             _rawConfig.channels_config.onebot_v11.require_at_in_group = true;
+         }
+
       }
     } else {
       _rawConfig.channels_config[key] = null;
