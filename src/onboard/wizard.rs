@@ -1,4 +1,7 @@
-use crate::config::schema::{DingTalkConfig, IrcConfig, OneBotV11Config, QQConfig, WhatsAppConfig};
+use crate::config::schema::{
+    DingTalkConfig, IrcConfig, OneBotCommandExternalNetworkAccess, OneBotV11Config, QQConfig,
+    WhatsAppConfig,
+};
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
     HeartbeatConfig, IMessageConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
@@ -3543,6 +3546,10 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         .filter(|s| !s.is_empty())
                         .collect(),
                     require_at_in_group,
+                    admin_users: vec![],
+                    admin_only_tools: vec![],
+                    command_external_network_access: OneBotCommandExternalNetworkAccess::Off,
+                    non_admin_context_file: "NON_ADMIN.md".to_string(),
                 });
             }
             _ => break, // Done
@@ -3977,6 +3984,16 @@ pub(crate) fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> 
          ## Open Loops\n\
          (Track unfinished tasks and follow-ups here)\n";
 
+    let non_admin = "\
+         # NON_ADMIN.md — Non-Admin Session Guardrails\n\n\
+         This context is injected for OneBot v11 conversations when the sender is NOT an admin user.\n\n\
+         ## Rules\n\
+         - You are currently talking to a non-admin user.\n\
+         - Do not execute administrator-only tools or privileged actions.\n\
+         - If asked to perform restricted actions, clearly refuse and suggest contacting the admin.\n\
+         - Never reveal secrets, tokens, credentials, or internal security settings.\n\
+         - Offer safe alternatives (explanations, read-only guidance, or next steps).\n";
+
     let files: Vec<(&str, String)> = vec![
         ("IDENTITY.md", identity),
         ("AGENTS.md", agents),
@@ -3986,6 +4003,7 @@ pub(crate) fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> 
         ("TOOLS.md", tools.to_string()),
         ("BOOTSTRAP.md", bootstrap),
         ("MEMORY.md", memory.to_string()),
+        ("NON_ADMIN.md", non_admin.to_string()),
     ];
 
     // Create subdirectories
@@ -4343,6 +4361,7 @@ mod tests {
             "TOOLS.md",
             "BOOTSTRAP.md",
             "MEMORY.md",
+            "NON_ADMIN.md",
         ];
         for f in &expected {
             assert!(tmp.path().join(f).exists(), "missing file: {f}");
@@ -4595,6 +4614,7 @@ mod tests {
             "TOOLS.md",
             "BOOTSTRAP.md",
             "MEMORY.md",
+            "NON_ADMIN.md",
         ] {
             let content = fs::read_to_string(tmp.path().join(f)).unwrap();
             assert!(!content.trim().is_empty(), "{f} should not be empty");

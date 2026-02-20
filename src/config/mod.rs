@@ -6,10 +6,10 @@ pub use schema::{
     ChannelsConfig, ComposioConfig, Config, CostConfig, CronConfig, DelegateAgentConfig,
     DiscordConfig, DockerRuntimeConfig, GatewayConfig, HardwareConfig, HardwareTransport,
     HeartbeatConfig, HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig,
-    MemoryConfig, ModelRouteConfig, ObservabilityConfig, OneBotV11Config, PeripheralBoardConfig,
-    PeripheralsConfig, ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend,
-    SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig, SlackConfig, TelegramConfig,
-    TunnelConfig, WebhookConfig,
+    MemoryConfig, ModelRouteConfig, ObservabilityConfig, OneBotCommandExternalNetworkAccess,
+    OneBotV11Config, PeripheralBoardConfig, PeripheralsConfig, ReliabilityConfig,
+    ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig,
+    SecretsConfig, SecurityConfig, SlackConfig, TelegramConfig, TunnelConfig, WebhookConfig,
 };
 
 #[cfg(test)]

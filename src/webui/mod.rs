@@ -84,11 +84,20 @@ pub async fn handle_api_config(State(state): State<AppState>) -> impl IntoRespon
     let config = state.config.lock();
 
     let onebot_v11_summary = config.channels_config.onebot_v11.as_ref().map(|o| {
+        let command_external_network_access = match o.command_external_network_access {
+            crate::config::OneBotCommandExternalNetworkAccess::Off => "off",
+            crate::config::OneBotCommandExternalNetworkAccess::On => "on",
+            crate::config::OneBotCommandExternalNetworkAccess::AdminOnly => "admin_only",
+        };
         serde_json::json!({
             "api_url": &o.api_url,
             "listen_host": &o.listen_host,
             "listen_port": o.listen_port,
             "allowed_users": o.allowed_users.len(),
+            "admin_users": o.admin_users.len(),
+            "admin_only_tools": o.admin_only_tools.len(),
+            "non_admin_context_file": &o.non_admin_context_file,
+            "command_external_network_access": command_external_network_access,
         })
     });
 
@@ -1050,7 +1059,10 @@ pub async fn handle_api_conversations_list(
         }
     }
 
-    (StatusCode::OK, Json(serde_json::json!({ "sessions": sessions })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "sessions": sessions })),
+    )
 }
 
 #[derive(serde::Deserialize, Debug, Default)]
@@ -1161,7 +1173,10 @@ pub async fn handle_api_conversations_messages(
         });
     }
 
-    (StatusCode::OK, Json(serde_json::json!({ "messages": messages })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "messages": messages })),
+    )
 }
 
 #[derive(serde::Deserialize, Debug, Default)]
@@ -1240,7 +1255,9 @@ pub async fn handle_api_conversations_clear(
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "status": "ok", "total": total, "removed": removed, "skipped": skipped })),
+        Json(
+            serde_json::json!({ "status": "ok", "total": total, "removed": removed, "skipped": skipped }),
+        ),
     )
 }
 
@@ -1449,6 +1466,7 @@ pub async fn handle_api_context_files_get(
         "HEARTBEAT.md",
         "BOOTSTRAP.md",
         "MEMORY.md",
+        "NON_ADMIN.md",
     ];
 
     for name in openclaw_files {
@@ -1458,8 +1476,27 @@ pub async fn handle_api_context_files_get(
             name,
             name,
             workspace.join(name),
-            !is_aieos,
+            !is_aieos && name != "NON_ADMIN.md",
         );
+    }
+
+    if let Some(onebot) = config.channels_config.onebot_v11.as_ref() {
+        let configured = onebot.non_admin_context_file.trim();
+        if !configured.is_empty() && configured != "NON_ADMIN.md" {
+            let abs = if std::path::Path::new(configured).is_absolute() {
+                std::path::PathBuf::from(configured)
+            } else {
+                workspace.join(configured)
+            };
+            push_file_candidate(
+                &mut candidates,
+                "onebot:non_admin_context",
+                "OneBot 非管理员上下文",
+                configured,
+                abs,
+                false,
+            );
+        }
     }
 
     if is_aieos {
@@ -1560,6 +1597,11 @@ pub async fn handle_api_context_files_get(
             "这里展示的是磁盘上的实时文件内容；点击刷新可立即看到外部修改。".to_string(),
             "WebUI Chat / agent::process_message 会在每次请求前重新读取这些文件。".to_string(),
             "Channels 通道在启动时构建系统提示词，修改 SOUL/IDENTITY 后通常需要重启 daemon/channels 才会全面生效。".to_string(),
+            "NON_ADMIN.md 为条件注入：仅在 OneBot v11 且发送者不是管理员时加入上下文。"
+                .to_string(),
+            "管理员工具白名单策略以 channels_config.onebot_v11.admin_users/admin_only_tools 为准。".to_string(),
+            "命令外网访问策略由 channels_config.onebot_v11.command_external_network_access 控制（off/on/admin_only）。"
+                .to_string(),
         ],
     })
 }
@@ -1670,12 +1712,10 @@ pub async fn handle_api_service_mutate(
 // ── WebUI Onboarding (首次引导) ───────────────────────────────────────────────
 
 fn webui_onboard_marker_path(workspace_dir: &std::path::Path) -> std::path::PathBuf {
-    workspace_dir
-        .join("state")
-        .join("webui_onboarded.json")
+    workspace_dir.join("state").join("webui_onboarded.json")
 }
 
-fn openclaw_scaffold_files() -> [&'static str; 8] {
+fn openclaw_scaffold_files() -> [&'static str; 9] {
     [
         "IDENTITY.md",
         "AGENTS.md",
@@ -1685,6 +1725,7 @@ fn openclaw_scaffold_files() -> [&'static str; 8] {
         "TOOLS.md",
         "BOOTSTRAP.md",
         "MEMORY.md",
+        "NON_ADMIN.md",
     ]
 }
 
@@ -1927,8 +1968,11 @@ pub async fn handle_api_onboard_scaffold(
             "onboarded_at": now,
             "version": env!("CARGO_PKG_VERSION"),
         });
-        if std::fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap_or_default())
-            .is_ok()
+        if std::fs::write(
+            &marker_path,
+            serde_json::to_vec_pretty(&marker).unwrap_or_default(),
+        )
+        .is_ok()
         {
             marker_written = true;
         }
@@ -1962,7 +2006,10 @@ pub async fn handle_api_onboard_mark_done(State(state): State<AppState>) -> impl
         "onboarded_at": now,
         "version": env!("CARGO_PKG_VERSION"),
     });
-    if let Err(e) = std::fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap_or_default()) {
+    if let Err(e) = std::fs::write(
+        &marker_path,
+        serde_json::to_vec_pretty(&marker).unwrap_or_default(),
+    ) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),

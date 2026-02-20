@@ -385,7 +385,7 @@ const ALL_CHANNELS = [
   {key:'discord',  name:'Discord', icon:'headset_mic', desc:'Discord Bot', schema:{bot_token:'str',guild_id:'str',allowed_users:'arr',listen_to_bots:'bool',mention_only:'bool'}},
   {key:'slack',    name:'Slack', icon:'tag', desc:'Slack Bot', schema:{bot_token:'str',app_token:'str',channel_id:'str',allowed_users:'arr'}},
   {key:'qq',       name:'QQ Official', icon:'smart_toy', desc:'QQ 官方机器人', schema:{app_id:'str',app_secret:'str',allowed_users:'arr'}},
-  {key:'onebot_v11', name:'NapCat / OneBot v11', icon:'hub', desc:'NapCat 作为 OneBot v11 接入', schema:{api_url:'str',access_token:'str',listen_host:'str',listen_port:'num',allowed_users:'arr',allowed_groups:'arr',require_at_in_group:'bool'}},
+  {key:'onebot_v11', name:'NapCat / OneBot v11', icon:'hub', desc:'NapCat 作为 OneBot v11 接入', schema:{api_url:'str',access_token:'str',listen_host:'str',listen_port:'num',allowed_users:'arr',allowed_groups:'arr',require_at_in_group:'bool',admin_users:'arr',admin_only_tools:'arr',command_external_network_access:'str',non_admin_context_file:'str'}},
   {key:'webhook',  name:'Webhook', icon:'webhook', desc:'HTTP 回调接口', schema:{port:'num',secret:'str'}},
   {key:'whatsapp', name:'WhatsApp', icon:'chat', desc:'Meta Business API', schema:{access_token:'str',phone_number_id:'str',verify_token:'str',app_secret:'str',allowed_numbers:'arr'}},
   {key:'lark',     name:'飞书 / Lark', icon:'apartment', desc:'飞书开放平台', schema:{app_id:'str',app_secret:'str',encrypt_key:'str',verification_token:'str',allowed_users:'arr',use_feishu:'bool',receive_mode:'str',port:'num'}},
@@ -393,7 +393,7 @@ const ALL_CHANNELS = [
   {key:'cli',      name:'CLI 终端', icon:'terminal', desc:'启用命令行交互通道', schema:{}},
 ];
 
-const CH_DICT = {bot_token:'机器人 Token', allowed_users:'授权用户ID (逗号分隔)', guild_id:'服务器 ID (Guild)', listen_to_bots:'监听其他机器人', mention_only:'仅响应@提及', app_token:'App Token', channel_id:'频道 ID', app_id:'应用 ID', app_secret:'应用密钥', port:'监听端口', secret:'密钥 (可选)', access_token:'访问令牌', phone_number_id:'电话号码ID', verify_token:'验证令牌', allowed_numbers:'授权电话号码', encrypt_key:'加密密钥', verification_token:'事件订阅Token', use_feishu:'使用飞书(而非Lark)', receive_mode:'接收模式(websocket/webhook)', client_id:'Client ID', client_secret:'Client Secret', api_url:'OneBot API 地址', listen_host:'回调监听地址', listen_port:'回调监听端口', allowed_groups:'授权群号 (逗号分隔，可空=全部)', require_at_in_group:'群聊仅响应@机器人'};
+const CH_DICT = {bot_token:'机器人 Token', allowed_users:'授权用户ID (逗号分隔)', guild_id:'服务器 ID (Guild)', listen_to_bots:'监听其他机器人', mention_only:'仅响应@提及', app_token:'App Token', channel_id:'频道 ID', app_id:'应用 ID', app_secret:'应用密钥', port:'监听端口', secret:'密钥 (可选)', access_token:'访问令牌', phone_number_id:'电话号码ID', verify_token:'验证令牌', allowed_numbers:'授权电话号码', encrypt_key:'加密密钥', verification_token:'事件订阅Token', use_feishu:'使用飞书(而非Lark)', receive_mode:'接收模式(websocket/webhook)', client_id:'Client ID', client_secret:'Client Secret', api_url:'OneBot API 地址', listen_host:'回调监听地址', listen_port:'回调监听端口', allowed_groups:'授权群号 (逗号分隔，可空=全部)', require_at_in_group:'群聊仅响应@机器人', admin_users:'管理员QQ (逗号分隔)', admin_only_tools:'仅管理员可用工具 (逗号分隔)', command_external_network_access:'命令外网访问策略', non_admin_context_file:'非管理员上下文文件路径'};
 
 
 function renderChannels(cfg){
@@ -436,7 +436,15 @@ function renderChannels(cfg){
       let val = data[k];
       const label = CH_DICT[k] || k;
       if(type==='arr') val = arr2str(val);
-      if(type==='bool'){
+      if(c.key==='onebot_v11' && k==='command_external_network_access'){
+        const mode = (val || 'off').toString();
+        fg.innerHTML=`<label>${esc(label)}</label>
+          <select class="form-input" data-path="channels_config.${c.key}.${k}">
+            <option value="off" ${mode==='off'?'selected':''}>关闭（禁止命令外网访问）</option>
+            <option value="on" ${mode==='on'?'selected':''}>开启（允许所有 OneBot 会话）</option>
+            <option value="admin_only" ${mode==='admin_only'?'selected':''}>仅管理员</option>
+          </select>`;
+      } else if(type==='bool'){
         fg.innerHTML=`<label class="checkbox-field"><input type="checkbox" data-path="channels_config.${c.key}.${k}" ${val?'checked':''}> <span>${esc(label)}</span></label>`;
       }else{
         fg.innerHTML=`<label>${esc(label)}</label><input class="form-input" type="${type==='num'?'number':'text'}" data-path="channels_config.${c.key}.${k}" data-valtype="${type}" value="${esc(val??'')}">`;
@@ -467,6 +475,10 @@ window.toggleChannel = function(el, key, checked){
              _rawConfig.channels_config.onebot_v11.allowed_users = [];
              _rawConfig.channels_config.onebot_v11.allowed_groups = [];
              _rawConfig.channels_config.onebot_v11.require_at_in_group = true;
+             _rawConfig.channels_config.onebot_v11.admin_users = [];
+             _rawConfig.channels_config.onebot_v11.admin_only_tools = [];
+             _rawConfig.channels_config.onebot_v11.command_external_network_access = 'off';
+             _rawConfig.channels_config.onebot_v11.non_admin_context_file = 'NON_ADMIN.md';
          }
 
       }
@@ -1231,6 +1243,7 @@ function fillOnboardFormsFromConfig(){
     document.getElementById('ob-onebot-allowed-users').value = arr2str(ch.onebot_v11.allowed_users||[]);
     document.getElementById('ob-onebot-allowed-groups').value = arr2str(ch.onebot_v11.allowed_groups||[]);
     document.getElementById('ob-onebot-require-at').checked = !!ch.onebot_v11.require_at_in_group;
+    document.getElementById('ob-onebot-net-access').value = ch.onebot_v11.command_external_network_access || 'off';
   }
 
   const tgOn = !!ch.telegram;
@@ -1657,6 +1670,10 @@ function applyOnboardToRawConfig(){
       allowed_users: allowedUsers,
       allowed_groups: allowedGroups,
       require_at_in_group: !!document.getElementById('ob-onebot-require-at')?.checked,
+      admin_users: Array.isArray(prev.admin_users) ? prev.admin_users : [],
+      admin_only_tools: Array.isArray(prev.admin_only_tools) ? prev.admin_only_tools : [],
+      command_external_network_access: (document.getElementById('ob-onebot-net-access')?.value || prev.command_external_network_access || 'off').trim() || 'off',
+      non_admin_context_file: (prev.non_admin_context_file || 'NON_ADMIN.md').trim() || 'NON_ADMIN.md',
     };
   }
 

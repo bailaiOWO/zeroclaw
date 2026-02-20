@@ -895,6 +895,8 @@ impl Default for ObservabilityConfig {
 pub struct AutonomyConfig {
     pub level: AutonomyLevel,
     pub workspace_only: bool,
+    /// Legacy command allowlist field (kept for config compatibility).
+    /// Runtime command gating is enforced via risk rules and syntax/network guards.
     pub allowed_commands: Vec<String>,
     pub forbidden_paths: Vec<String>,
     pub max_actions_per_hour: u32,
@@ -904,7 +906,7 @@ pub struct AutonomyConfig {
     #[serde(default = "default_true")]
     pub require_approval_for_medium_risk: bool,
 
-    /// Block high-risk shell commands even if allowlisted.
+    /// Block high-risk shell commands.
     #[serde(default = "default_true")]
     pub block_high_risk_commands: bool,
 
@@ -1702,6 +1704,18 @@ pub struct QQConfig {
     pub allowed_users: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OneBotCommandExternalNetworkAccess {
+    /// Disable external-network shell commands (including curl/wget and PowerShell web-request patterns).
+    #[default]
+    Off,
+    /// Allow all OneBot senders to run shell commands that access external networks.
+    On,
+    /// Allow external-network shell commands only when sender matches `admin_users`.
+    AdminOnly,
+}
+
 /// OneBot v11 configuration (NapCat / go-cqhttp compatible).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OneBotV11Config {
@@ -1726,6 +1740,21 @@ pub struct OneBotV11Config {
     /// In group chats, require @mention (or to_me) before forwarding messages.
     #[serde(default = "default_onebot_require_at_in_group")]
     pub require_at_in_group: bool,
+    /// QQ user IDs treated as administrators in OneBot conversations.
+    ///
+    /// Admin users can invoke tools listed in `admin_only_tools`.
+    #[serde(default)]
+    pub admin_users: Vec<String>,
+    /// Tool names that are only available when the sender is an admin user.
+    #[serde(default)]
+    pub admin_only_tools: Vec<String>,
+    /// External network access policy for shell commands.
+    ///
+    /// `off` | `on` | `admin_only`
+    #[serde(default)]
+    pub command_external_network_access: OneBotCommandExternalNetworkAccess,
+    #[serde(default = "default_onebot_non_admin_context_file")]
+    pub non_admin_context_file: String,
 }
 
 fn default_onebot_listen_host() -> String {
@@ -1738,6 +1767,10 @@ fn default_onebot_listen_port() -> u16 {
 
 fn default_onebot_require_at_in_group() -> bool {
     true
+}
+
+fn default_onebot_non_admin_context_file() -> String {
+    "NON_ADMIN.md".to_string()
 }
 
 // ── Config impl ──────────────────────────────────────────────────
@@ -3857,6 +3890,13 @@ api_url = "http://127.0.0.1:3000"
         assert!(parsed.allowed_users.is_empty());
         assert!(parsed.allowed_groups.is_empty());
         assert!(parsed.require_at_in_group);
+        assert!(parsed.admin_users.is_empty());
+        assert!(parsed.admin_only_tools.is_empty());
+        assert_eq!(
+            parsed.command_external_network_access,
+            OneBotCommandExternalNetworkAccess::Off
+        );
+        assert_eq!(parsed.non_admin_context_file, "NON_ADMIN.md");
     }
 
     #[test]
@@ -3869,6 +3909,10 @@ api_url = "http://127.0.0.1:3000"
             allowed_users: vec!["10001".into(), "*".into()],
             allowed_groups: vec!["20001".into()],
             require_at_in_group: false,
+            admin_users: vec!["10001".into()],
+            admin_only_tools: vec!["shell".into(), "schedule".into()],
+            command_external_network_access: OneBotCommandExternalNetworkAccess::AdminOnly,
+            non_admin_context_file: "contexts/non_admin.md".into(),
         };
         let toml = toml::to_string(&cfg).unwrap();
         let parsed: OneBotV11Config = toml::from_str(&toml).unwrap();
@@ -3876,6 +3920,13 @@ api_url = "http://127.0.0.1:3000"
         assert_eq!(parsed.listen_port, 18080);
         assert_eq!(parsed.allowed_groups, vec!["20001"]);
         assert!(!parsed.require_at_in_group);
+        assert_eq!(parsed.admin_users, vec!["10001"]);
+        assert_eq!(parsed.admin_only_tools, vec!["shell", "schedule"]);
+        assert_eq!(
+            parsed.command_external_network_access,
+            OneBotCommandExternalNetworkAccess::AdminOnly
+        );
+        assert_eq!(parsed.non_admin_context_file, "contexts/non_admin.md");
     }
 
     // ── Config file permission hardening (Unix only) ───────────────

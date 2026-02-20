@@ -574,6 +574,14 @@
                 <div class="form-group"><label>回调监听端口</label><input class="form-input" id="ob-onebot-listen-port" type="number" placeholder="8096"></div>
                 <div class="form-group"><label>授权 QQ（逗号分隔；* = 允许全部；留空 = 拒绝全部）</label><input class="form-input" id="ob-onebot-allowed-users" type="text" placeholder="例如: 12345, 67890 或 *"></div>
                 <div class="form-group"><label>授权群号（逗号分隔；留空 = 允许全部）</label><input class="form-input" id="ob-onebot-allowed-groups" type="text" placeholder="例如: 98765 或留空"></div>
+                <div class="form-group">
+                  <label>命令外网访问</label>
+                  <select class="form-input" id="ob-onebot-net-access">
+                    <option value="off">关闭（禁止命令外网访问）</option>
+                    <option value="on">开启（允许所有 OneBot 会话）</option>
+                    <option value="admin_only">仅管理员</option>
+                  </select>
+                </div>
                 <label class="checkbox-field"><input type="checkbox" id="ob-onebot-require-at"> <span>群聊仅响应 @ 机器人</span></label>
               </div>
             </div>

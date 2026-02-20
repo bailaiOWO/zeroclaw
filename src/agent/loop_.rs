@@ -9,6 +9,7 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
+use std::collections::HashSet;
 use std::fmt::Write;
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
@@ -88,10 +89,18 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 /// Max characters retained in stored compaction summary.
 const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
 
+fn normalize_tool_name_for_policy(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
 /// Convert a tool registry to OpenAI function-calling format for native tool support.
-fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::Value> {
+fn tools_to_openai_format(
+    tools_registry: &[Box<dyn Tool>],
+    blocked_tools: Option<&HashSet<String>>,
+) -> Vec<serde_json::Value> {
     tools_registry
         .iter()
+        .filter(|tool| !is_tool_blocked_for_sender(blocked_tools, tool.name()))
         .map(|tool| {
             serde_json::json!({
                 "type": "function",
@@ -321,7 +330,12 @@ async fn persist_session_conversation_turn(
     .unwrap_or(trimmed);
 
     let _ = mem
-        .store(&key, &stored, MemoryCategory::Conversation, Some(session_id))
+        .store(
+            &key,
+            &stored,
+            MemoryCategory::Conversation,
+            Some(session_id),
+        )
         .await;
 }
 
@@ -368,6 +382,50 @@ fn build_hardware_context(
 /// Find a tool by name in the registry.
 fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
+}
+
+fn is_tool_blocked_for_sender(blocked_tools: Option<&HashSet<String>>, tool_name: &str) -> bool {
+    blocked_tools.is_some_and(|set| set.contains(&normalize_tool_name_for_policy(tool_name)))
+}
+
+fn restricted_tool_denied_message(tool_name: &str) -> String {
+    format!("Denied: `{tool_name}` is restricted to administrator conversations on this channel.")
+}
+
+fn external_network_command_denied_message() -> String {
+    "Denied: external-network command access is disabled for this conversation.".to_string()
+}
+
+fn extract_tool_command_argument(arguments: &serde_json::Value) -> Option<&str> {
+    arguments
+        .get("command")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+}
+
+fn is_external_network_command_call(call: &ParsedToolCall) -> bool {
+    let normalized_tool_name = normalize_tool_name_for_policy(&call.name);
+    let supports_shell_commands = matches!(
+        normalized_tool_name.as_str(),
+        "shell" | "cron_add" | "cron_update" | "schedule"
+    );
+    if !supports_shell_commands {
+        return false;
+    }
+
+    if normalized_tool_name == "cron_add"
+        && call
+            .arguments
+            .get("job_type")
+            .and_then(|v| v.as_str())
+            .is_some_and(|job_type| job_type.eq_ignore_ascii_case("agent"))
+    {
+        return false;
+    }
+
+    extract_tool_command_argument(&call.arguments)
+        .is_some_and(SecurityPolicy::command_uses_external_network)
 }
 
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
@@ -716,6 +774,8 @@ pub(crate) async fn agent_turn(
         None,
         "channel",
         DEFAULT_MAX_TOOL_ITERATIONS,
+        None,
+        false,
     )
     .await
 }
@@ -735,14 +795,16 @@ pub(crate) async fn run_tool_call_loop(
     approval: Option<&ApprovalManager>,
     channel_name: &str,
     max_tool_iterations: usize,
+    blocked_tools: Option<&HashSet<String>>,
+    allow_external_network_commands: bool,
 ) -> Result<String> {
     // Build native tool definitions once if the provider supports them.
-    let use_native_tools = provider.supports_native_tools() && !tools_registry.is_empty();
-    let tool_definitions = if use_native_tools {
-        tools_to_openai_format(tools_registry)
+    let tool_definitions = if provider.supports_native_tools() && !tools_registry.is_empty() {
+        tools_to_openai_format(tools_registry, blocked_tools)
     } else {
         Vec::new()
     };
+    let use_native_tools = provider.supports_native_tools() && !tool_definitions.is_empty();
 
     for _iteration in 0..max_tool_iterations {
         observer.record_event(&ObserverEvent::LlmRequest {
@@ -875,6 +937,28 @@ pub(crate) async fn run_tool_call_loop(
         let mut tool_results = String::new();
         let mut individual_results: Vec<String> = Vec::new();
         for call in &tool_calls {
+            if is_tool_blocked_for_sender(blocked_tools, &call.name) {
+                let denied = restricted_tool_denied_message(&call.name);
+                individual_results.push(denied.clone());
+                let _ = writeln!(
+                    tool_results,
+                    "<tool_result name=\"{}\">\n{denied}\n</tool_result>",
+                    call.name
+                );
+                continue;
+            }
+
+            if !allow_external_network_commands && is_external_network_command_call(call) {
+                let denied = external_network_command_denied_message();
+                individual_results.push(denied.clone());
+                let _ = writeln!(
+                    tool_results,
+                    "<tool_result name=\"{}\">\n{denied}\n</tool_result>",
+                    call.name
+                );
+                continue;
+            }
+
             // ── Approval hook ────────────────────────────────
             if let Some(mgr) = approval {
                 if mgr.needs_approval(&call.name) {
@@ -1277,6 +1361,8 @@ pub async fn run(
             Some(&approval_manager),
             "cli",
             config.agent.max_tool_iterations,
+            None,
+            false,
         )
         .await?;
         final_output = response.clone();
@@ -1401,6 +1487,8 @@ pub async fn run(
                 Some(&approval_manager),
                 "cli",
                 config.agent.max_tool_iterations,
+                None,
+                false,
             )
             .await
             {
@@ -1520,7 +1608,6 @@ pub async fn process_message_with_session(
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = config
         .default_model
-
         .clone()
         .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
     let provider: Box<dyn Provider> = providers::create_routed_provider(
@@ -1609,7 +1696,8 @@ pub async fn process_message_with_session(
     let session_id = session_id.map(str::to_string);
     let conversation_history = if config.memory.auto_save {
         if let Some(sid) = session_id.as_deref() {
-            load_session_conversation_history(mem.as_ref(), sid, config.agent.max_history_messages).await
+            load_session_conversation_history(mem.as_ref(), sid, config.agent.max_history_messages)
+                .await
         } else {
             Vec::new()
         }
@@ -1685,7 +1773,180 @@ mod tests {
         assert!(scrubbed.contains("public"));
     }
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
+    use crate::observability::NoopObserver;
+    use crate::tools::{Tool, ToolResult};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tempfile::TempDir;
+
+    struct BlockingTestProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for BlockingTestProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(
+                "<tool_call>\n{\"name\":\"counting_tool\",\"arguments\":{}}\n</tool_call>"
+                    .to_string(),
+            )
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let has_tool_results = messages
+                .iter()
+                .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"));
+            if has_tool_results {
+                Ok("done".to_string())
+            } else {
+                Ok(
+                    "<tool_call>\n{\"name\":\"counting_tool\",\"arguments\":{}}\n</tool_call>"
+                        .to_string(),
+                )
+            }
+        }
+    }
+
+    struct CountingTool {
+        hits: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for CountingTool {
+        fn name(&self) -> &str {
+            "counting_tool"
+        }
+
+        fn description(&self) -> &str {
+            "increments a counter"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: "executed".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    struct ExternalNetworkShellProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for ExternalNetworkShellProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(
+                "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"curl https://example.com\"}}\n</tool_call>"
+                    .to_string(),
+            )
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let has_tool_results = messages
+                .iter()
+                .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"));
+            if has_tool_results {
+                Ok("done".to_string())
+            } else {
+                Ok(
+                    "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"curl https://example.com\"}}\n</tool_call>"
+                        .to_string(),
+                )
+            }
+        }
+    }
+
+    struct ShellCountingTool {
+        hits: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ShellCountingTool {
+        fn name(&self) -> &str {
+            "shell"
+        }
+
+        fn description(&self) -> &str {
+            "mock shell"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: "executed".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn external_network_command_detection_handles_command_tools() {
+        let shell_call = ParsedToolCall {
+            name: "shell".to_string(),
+            arguments: serde_json::json!({ "command": "curl https://example.com" }),
+        };
+        assert!(is_external_network_command_call(&shell_call));
+
+        let powershell_call = ParsedToolCall {
+            name: "shell".to_string(),
+            arguments: serde_json::json!({ "command": "powershell -Command \"Invoke-WebRequest -Uri 'https://example.com'\"" }),
+        };
+        assert!(is_external_network_command_call(&powershell_call));
+
+        let cron_agent_call = ParsedToolCall {
+            name: "cron_add".to_string(),
+            arguments: serde_json::json!({
+                "job_type": "agent",
+                "command": "curl https://example.com"
+            }),
+        };
+        assert!(!is_external_network_command_call(&cron_agent_call));
+
+        let cron_shell_call = ParsedToolCall {
+            name: "cron_add".to_string(),
+            arguments: serde_json::json!({
+                "job_type": "shell",
+                "command": "curl https://example.com"
+            }),
+        };
+        assert!(is_external_network_command_call(&cron_shell_call));
+
+        let schedule_local_call = ParsedToolCall {
+            name: "schedule".to_string(),
+            arguments: serde_json::json!({ "command": "echo hello" }),
+        };
+        assert!(!is_external_network_command_call(&schedule_local_call));
+    }
 
     #[test]
     fn parse_tool_calls_extracts_single_call() {
@@ -1950,7 +2211,7 @@ Tail"#;
             std::path::Path::new("/tmp"),
         ));
         let tools = tools::default_tools(security);
-        let formatted = tools_to_openai_format(&tools);
+        let formatted = tools_to_openai_format(&tools, None);
 
         assert!(!formatted.is_empty());
         for tool_json in &formatted {
@@ -1966,6 +2227,116 @@ Tail"#;
             .collect();
         assert!(names.contains(&"shell"));
         assert!(names.contains(&"file_read"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_blocks_restricted_tools() {
+        let provider = BlockingTestProvider;
+        let observer = NoopObserver;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool {
+            hits: Arc::clone(&hits),
+        })];
+        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("run tool")];
+        let blocked: std::collections::HashSet<String> =
+            ["counting_tool".to_string()].into_iter().collect();
+
+        let response = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "test-provider",
+            "test-model",
+            0.0,
+            true,
+            None,
+            "onebot_v11",
+            3,
+            Some(&blocked),
+            false,
+        )
+        .await
+        .expect("loop should finish");
+
+        assert_eq!(response, "done");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "restricted tool should not execute"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_blocks_shell_external_network_calls_when_disabled() {
+        let provider = ExternalNetworkShellProvider;
+        let observer = NoopObserver;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(ShellCountingTool {
+            hits: Arc::clone(&hits),
+        })];
+        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("run tool")];
+
+        let response = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "test-provider",
+            "test-model",
+            0.0,
+            true,
+            None,
+            "onebot_v11",
+            3,
+            None,
+            false,
+        )
+        .await
+        .expect("loop should finish");
+
+        assert_eq!(response, "done");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "shell network command should be denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_allows_shell_external_network_calls_when_enabled() {
+        let provider = ExternalNetworkShellProvider;
+        let observer = NoopObserver;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(ShellCountingTool {
+            hits: Arc::clone(&hits),
+        })];
+        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("run tool")];
+
+        let response = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "test-provider",
+            "test-model",
+            0.0,
+            true,
+            None,
+            "onebot_v11",
+            3,
+            None,
+            true,
+        )
+        .await
+        .expect("loop should finish");
+
+        assert_eq!(response, "done");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "shell network command should execute"
+        );
     }
 
     #[test]

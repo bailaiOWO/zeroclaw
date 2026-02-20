@@ -34,6 +34,22 @@ impl RuntimeAdapter for NativeRuntime {
         true
     }
 
+    #[cfg(target_os = "windows")]
+    fn build_shell_command(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+    ) -> anyhow::Result<tokio::process::Command> {
+        let shell = std::env::var("ComSpec")
+            .or_else(|_| std::env::var("COMSPEC"))
+            .unwrap_or_else(|_| "cmd.exe".to_string());
+
+        let mut process = tokio::process::Command::new(shell);
+        process.arg("/C").arg(command).current_dir(workspace_dir);
+        Ok(process)
+    }
+
+    #[cfg(not(target_os = "windows"))]
     fn build_shell_command(
         &self,
         command: &str,
@@ -88,5 +104,18 @@ mod tests {
             .unwrap();
         let debug = format!("{command:?}");
         assert!(debug.contains("echo hello"));
+    }
+
+    #[test]
+    fn native_builds_platform_shell_wrapper() {
+        let cwd = std::env::temp_dir();
+        let command = NativeRuntime::new()
+            .build_shell_command("echo hello", &cwd)
+            .unwrap();
+        let debug = format!("{command:?}").to_lowercase();
+        #[cfg(target_os = "windows")]
+        assert!(debug.contains("/c") && debug.contains("cmd"));
+        #[cfg(not(target_os = "windows"))]
+        assert!(debug.contains("sh") && debug.contains("-c"));
     }
 }

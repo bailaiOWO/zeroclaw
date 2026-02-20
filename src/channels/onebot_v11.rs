@@ -150,11 +150,7 @@ impl OneBotV11Channel {
             s.card
                 .as_deref()
                 .filter(|c| !c.trim().is_empty())
-                .or_else(|| {
-                    s.nickname
-                        .as_deref()
-                        .filter(|n| !n.trim().is_empty())
-                })
+                .or_else(|| s.nickname.as_deref().filter(|n| !n.trim().is_empty()))
                 .map(ToString::to_string)
         });
 
@@ -618,6 +614,35 @@ fn parse_path_only_attachment(message: &str) -> Option<OneBotAttachment> {
     })
 }
 
+fn normalize_attachment_marker_whitespace(text: &str) -> String {
+    let mut normalized_lines: Vec<String> = Vec::new();
+    let mut blank_run = 0usize;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end_matches('\r');
+
+        if line.trim().is_empty() {
+            blank_run += 1;
+            continue;
+        }
+
+        if !normalized_lines.is_empty() {
+            match blank_run {
+                0 => {}
+                1 => normalized_lines.push(String::new()),
+                // Marker-only attachment lines can create large blank runs.
+                // Collapse 2+ consecutive empty lines down to a single line break.
+                _ => {}
+            }
+        }
+
+        normalized_lines.push(line.to_string());
+        blank_run = 0;
+    }
+
+    normalized_lines.join("\n").trim().to_string()
+}
+
 fn parse_attachment_markers(message: &str) -> (String, Vec<OneBotAttachment>) {
     let mut cleaned = String::with_capacity(message.len());
     let mut attachments = Vec::new();
@@ -661,7 +686,12 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<OneBotAttachment>) {
         cursor = close + 1;
     }
 
-    (cleaned.trim().to_string(), attachments)
+    let cleaned = if attachments.is_empty() {
+        cleaned.trim().to_string()
+    } else {
+        normalize_attachment_marker_whitespace(cleaned.trim())
+    };
+    (cleaned, attachments)
 }
 
 fn strip_tool_call_tags(message: &str) -> String {
@@ -916,12 +946,49 @@ mod tests {
             allowed_users: vec!["*".to_string()],
             allowed_groups: vec![],
             require_at_in_group: true,
+            admin_users: vec![],
+            admin_only_tools: vec![],
+            command_external_network_access: crate::config::OneBotCommandExternalNetworkAccess::Off,
+            non_admin_context_file: "NON_ADMIN.md".to_string(),
         })
     }
 
     #[test]
     fn channel_name_is_stable() {
         assert_eq!(channel().name(), "onebot_v11");
+    }
+
+    #[test]
+    fn parse_attachment_markers_collapses_marker_induced_blank_runs() {
+        let message = "主人，图片下载好了。\n这就发给你哦：\n[IMAGE:/tmp/a.png]\n[IMAGE:/tmp/b.png]\n[IMAGE:/tmp/c.png]\n[IMAGE:/tmp/d.png]\n\n如果还要继续下载，告诉我就好。";
+
+        let (cleaned, attachments) = parse_attachment_markers(message);
+
+        assert_eq!(attachments.len(), 4);
+        assert_eq!(
+            cleaned,
+            "主人，图片下载好了。\n这就发给你哦：\n如果还要继续下载，告诉我就好。"
+        );
+    }
+
+    #[test]
+    fn parse_attachment_markers_preserves_normal_single_paragraph_break() {
+        let message = "第一段。\n\n第二段。\n[IMAGE:/tmp/a.png]\n[IMAGE:/tmp/b.png]\n第三段。";
+
+        let (cleaned, attachments) = parse_attachment_markers(message);
+
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(cleaned, "第一段。\n\n第二段。\n第三段。");
+    }
+
+    #[test]
+    fn parse_attachment_markers_keeps_inline_text() {
+        let message = "前缀[IMAGE:/tmp/a.png]后缀";
+
+        let (cleaned, attachments) = parse_attachment_markers(message);
+
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(cleaned, "前缀后缀");
     }
 
     #[test]
@@ -988,6 +1055,10 @@ mod tests {
             allowed_users: vec!["42".to_string()],
             allowed_groups: vec![],
             require_at_in_group: false,
+            admin_users: vec![],
+            admin_only_tools: vec![],
+            command_external_network_access: crate::config::OneBotCommandExternalNetworkAccess::Off,
+            non_admin_context_file: "NON_ADMIN.md".to_string(),
         });
 
         let event: OneBotEvent = serde_json::from_value(json!({
@@ -1005,18 +1076,25 @@ mod tests {
     #[test]
     fn callback_auth_accepts_authorization_header() {
         let mut headers = HeaderMap::new();
-        headers.insert(header::AUTHORIZATION, "Bearer napcat_token".parse().unwrap());
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer napcat_token".parse().unwrap(),
+        );
 
-        assert!(callback_is_authorized("napcat_token", &headers, br#"{"k":"v"}"#));
+        assert!(callback_is_authorized(
+            "napcat_token",
+            &headers,
+            br#"{"k":"v"}"#
+        ));
     }
 
     #[test]
     fn callback_auth_accepts_napcat_x_signature() {
         let token = "napcat_token";
-        let body = br#"{"post_type":"message","message_type":"private","user_id":1,"message":"hi"}"#;
+        let body =
+            br#"{"post_type":"message","message_type":"private","user_id":1,"message":"hi"}"#;
 
-        let key =
-            ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, token.as_bytes());
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, token.as_bytes());
         let signature = ring::hmac::sign(&key, body);
 
         let mut headers = HeaderMap::new();
@@ -1044,6 +1122,10 @@ mod tests {
     #[test]
     fn callback_auth_rejects_when_no_auth_headers_exist() {
         let headers = HeaderMap::new();
-        assert!(!callback_is_authorized("napcat_token", &headers, br#"{"post_type":"message"}"#));
+        assert!(!callback_is_authorized(
+            "napcat_token",
+            &headers,
+            br#"{"post_type":"message"}"#
+        ));
     }
 }

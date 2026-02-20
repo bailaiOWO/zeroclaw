@@ -11,6 +11,7 @@ use crate::security::SecurityPolicy;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::{stream, StreamExt};
+use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::time::{self, Duration};
@@ -448,10 +449,28 @@ async fn run_job_command_with_timeout(
         );
     }
 
-    let child = match Command::new("sh")
-        .arg("-lc")
+    #[cfg(target_os = "windows")]
+    let mut shell = {
+        let shell_path = std::env::var("ComSpec")
+            .or_else(|_| std::env::var("COMSPEC"))
+            .unwrap_or_else(|_| "cmd.exe".to_string());
+        let mut cmd = Command::new(shell_path);
+        cmd.arg("/C");
+        cmd
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let mut shell = {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-lc");
+        cmd
+    };
+
+    let child = match shell
         .arg(&job.command)
         .current_dir(&config.workspace_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
     {
@@ -523,6 +542,28 @@ mod tests {
         }
     }
 
+    fn missing_file_command(path: &str) -> String {
+        #[cfg(target_os = "windows")]
+        {
+            format!("dir {path}")
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            format!("ls {path}")
+        }
+    }
+
+    fn timeout_command() -> &'static str {
+        #[cfg(target_os = "windows")]
+        {
+            "powershell -Command \"Start-Sleep -Seconds 1\""
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            "sleep 1"
+        }
+    }
+
     #[tokio::test]
     async fn run_job_command_success() {
         let tmp = TempDir::new().unwrap();
@@ -533,28 +574,29 @@ mod tests {
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(success);
         assert!(output.contains("scheduler-ok"));
-        assert!(output.contains("status=exit status: 0"));
+        assert!(output.contains("status="));
+        assert!(output.contains("0"));
     }
 
     #[tokio::test]
     async fn run_job_command_failure() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
-        let job = test_job("ls definitely_missing_file_for_scheduler_test");
+        let missing = "definitely_missing_file_for_scheduler_test";
+        let job = test_job(&missing_file_command(missing));
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
-        assert!(output.contains("definitely_missing_file_for_scheduler_test"));
-        assert!(output.contains("status=exit status:"));
+        assert!(output.contains(missing));
+        assert!(output.contains("status="));
     }
 
     #[tokio::test]
     async fn run_job_command_times_out() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp);
-        config.autonomy.allowed_commands = vec!["sleep".into()];
-        let job = test_job("sleep 1");
+        let config = test_config(&tmp);
+        let job = test_job(timeout_command());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
         let (success, output) =
@@ -626,19 +668,40 @@ mod tests {
         let mut config = test_config(&tmp);
         config.reliability.scheduler_retries = 1;
         config.reliability.provider_backoff_ms = 1;
-        config.autonomy.allowed_commands = vec!["sh".into()];
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        std::fs::write(
-            config.workspace_dir.join("retry-once.sh"),
-            "#!/bin/sh\nif [ -f retry-ok.flag ]; then\n  echo recovered\n  exit 0\nfi\ntouch retry-ok.flag\nexit 1\n",
-        )
-        .unwrap();
+        #[cfg(target_os = "windows")]
+        {
+            std::fs::write(
+                config.workspace_dir.join("retry-once.cmd"),
+                "@echo off\r\nif exist retry-ok.flag (\r\n  echo recovered\r\n  exit /b 0\r\n)\r\ntype nul > retry-ok.flag\r\nexit /b 1\r\n",
+            )
+            .unwrap();
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            std::fs::write(
+                config.workspace_dir.join("retry-once.sh"),
+                "#!/bin/sh\nif [ -f retry-ok.flag ]; then\n  echo recovered\n  exit 0\nfi\ntouch retry-ok.flag\nexit 1\n",
+            )
+            .unwrap();
+        }
+
+        #[cfg(target_os = "windows")]
+        let job = test_job("retry-once.cmd");
+        #[cfg(not(target_os = "windows"))]
         let job = test_job("sh ./retry-once.sh");
 
         let (success, output) = execute_job_with_retry(&config, &security, &job).await;
         assert!(success);
         assert!(output.contains("recovered"));
+
+        let _ = std::fs::remove_file(config.workspace_dir.join("retry-ok.flag"));
+        #[cfg(target_os = "windows")]
+        let _ = std::fs::remove_file(config.workspace_dir.join("retry-once.cmd"));
+        #[cfg(not(target_os = "windows"))]
+        let _ = std::fs::remove_file(config.workspace_dir.join("retry-once.sh"));
     }
 
     #[tokio::test]
@@ -647,13 +710,14 @@ mod tests {
         let mut config = test_config(&tmp);
         config.reliability.scheduler_retries = 1;
         config.reliability.provider_backoff_ms = 1;
+        let missing = "always_missing_for_retry_test";
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let job = test_job("ls always_missing_for_retry_test");
+        let job = test_job(&missing_file_command(missing));
 
         let (success, output) = execute_job_with_retry(&config, &security, &job).await;
         assert!(!success);
-        assert!(output.contains("always_missing_for_retry_test"));
+        assert!(output.contains(missing));
     }
 
     #[tokio::test]
@@ -770,7 +834,9 @@ mod tests {
         let onebot_err = deliver_if_configured(&config, &onebot_job, "x")
             .await
             .unwrap_err();
-        assert!(onebot_err.to_string().contains("onebot_v11 channel not configured"));
+        assert!(onebot_err
+            .to_string()
+            .contains("onebot_v11 channel not configured"));
 
         let mut qq_job = test_job("echo ok");
         qq_job.delivery = DeliveryConfig {
@@ -779,7 +845,9 @@ mod tests {
             to: Some("user:10001".into()),
             best_effort: true,
         };
-        let qq_err = deliver_if_configured(&config, &qq_job, "x").await.unwrap_err();
+        let qq_err = deliver_if_configured(&config, &qq_job, "x")
+            .await
+            .unwrap_err();
         assert!(qq_err.to_string().contains("qq channel not configured"));
     }
 }

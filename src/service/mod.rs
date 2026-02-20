@@ -88,12 +88,7 @@ fn stop(config: &Config) -> Result<()> {
 fn restart(config: &Config) -> Result<()> {
     if cfg!(target_os = "macos") {
         let plist = macos_service_file()?;
-        let _ = run_checked(
-            Command::new("launchctl")
-                .arg("load")
-                .arg("-w")
-                .arg(&plist),
-        );
+        let _ = run_checked(Command::new("launchctl").arg("load").arg("-w").arg(&plist));
 
         // Preferred: restart in one shot when launchctl target is resolvable.
         if let Ok(uid) = std::env::var("UID") {

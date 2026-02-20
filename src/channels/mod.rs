@@ -33,7 +33,7 @@ pub use traits::{Channel, SendMessage};
 pub use whatsapp::WhatsAppChannel;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
-use crate::config::Config;
+use crate::config::{Config, OneBotCommandExternalNetworkAccess};
 use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::{self, Observer};
@@ -44,8 +44,9 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -67,6 +68,7 @@ const CHANNEL_AUTOSAVE_MAX_CHARS: usize = 4_000;
 const CHANNEL_PARALLELISM_PER_CHANNEL: usize = 4;
 const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
+const DEFAULT_NON_ADMIN_CONTEXT_FILE: &str = "NON_ADMIN.md";
 
 #[derive(Clone)]
 struct ChannelRuntimeContext {
@@ -82,6 +84,11 @@ struct ChannelRuntimeContext {
     max_tool_iterations: usize,
     max_history_messages: usize,
     isolate_channel_conversations: bool,
+    workspace_dir: Arc<PathBuf>,
+    onebot_admin_users: Arc<Vec<String>>,
+    onebot_admin_only_tools: Arc<HashSet<String>>,
+    onebot_non_admin_context_file: Arc<String>,
+    onebot_command_external_network_access: OneBotCommandExternalNetworkAccess,
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
@@ -142,7 +149,10 @@ async fn load_conversation_history(
     }
 
     let Ok(mut entries) = mem
-        .list(Some(&memory::MemoryCategory::Conversation), Some(session_id))
+        .list(
+            Some(&memory::MemoryCategory::Conversation),
+            Some(session_id),
+        )
         .await
     else {
         return Vec::new();
@@ -260,7 +270,113 @@ async fn build_memory_context(mem: &dyn Memory, user_msg: &str) -> String {
     context
 }
 
-fn channel_sender_context(msg: &traits::ChannelMessage) -> Option<String> {
+fn normalize_tool_policy_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
+fn is_onebot_admin_sender(msg: &traits::ChannelMessage, admin_users: &[String]) -> bool {
+    if msg.channel != "onebot_v11" || admin_users.is_empty() {
+        return false;
+    }
+
+    let sender = msg.sender.trim();
+    if sender.is_empty() {
+        return false;
+    }
+
+    admin_users.iter().any(|entry| {
+        let normalized = entry.trim();
+        !normalized.is_empty() && (normalized == "*" || normalized == sender)
+    })
+}
+
+fn blocked_tools_for_sender(
+    msg: &traits::ChannelMessage,
+    is_admin: bool,
+    admin_users: &[String],
+    admin_only_tools: &HashSet<String>,
+) -> HashSet<String> {
+    if msg.channel != "onebot_v11" || admin_users.is_empty() || is_admin {
+        return HashSet::new();
+    }
+
+    admin_only_tools.clone()
+}
+
+fn onebot_external_network_command_allowed(
+    channel: &str,
+    mode: OneBotCommandExternalNetworkAccess,
+    sender_is_admin: bool,
+) -> bool {
+    if channel != "onebot_v11" {
+        return false;
+    }
+
+    matches!(mode, OneBotCommandExternalNetworkAccess::On)
+        || (matches!(mode, OneBotCommandExternalNetworkAccess::AdminOnly) && sender_is_admin)
+}
+
+fn build_non_admin_context_message(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    is_admin: bool,
+    blocked_tools: &HashSet<String>,
+) -> Option<String> {
+    if msg.channel != "onebot_v11" || ctx.onebot_admin_users.is_empty() || is_admin {
+        return None;
+    }
+
+    let mut lines = vec![
+        "当前会话身份：非管理员（对方不是你的主人/管理员）。".to_string(),
+        "你必须拒绝管理员专属工具和高权限请求；可改为给出安全替代方案。".to_string(),
+    ];
+
+    if matches!(
+        ctx.onebot_command_external_network_access,
+        OneBotCommandExternalNetworkAccess::AdminOnly
+    ) {
+        lines.push("外网命令权限：仅管理员可用；当前会话禁止执行外网命令。".to_string());
+    }
+
+    if !blocked_tools.is_empty() {
+        let mut tools: Vec<String> = blocked_tools.iter().cloned().collect();
+        tools.sort();
+        lines.push(format!("管理员专属工具：{}", tools.join(", ")));
+    }
+
+    let configured = ctx.onebot_non_admin_context_file.trim();
+    let relative = if configured.is_empty() {
+        DEFAULT_NON_ADMIN_CONTEXT_FILE
+    } else {
+        configured
+    };
+    let abs_path = if Path::new(relative).is_absolute() {
+        PathBuf::from(relative)
+    } else {
+        ctx.workspace_dir.join(relative)
+    };
+
+    if let Ok(content) = std::fs::read_to_string(&abs_path) {
+        let trimmed = content.trim();
+        if !trimmed.is_empty() {
+            lines.push(format!("--- 来自 {} ---", abs_path.display()));
+            lines.push(trimmed.to_string());
+        }
+    }
+
+    Some(format!(
+        "【非管理员权限上下文】\n{}\n【/非管理员权限上下文】",
+        lines.join("\n")
+    ))
+}
+
+fn channel_sender_context(
+    msg: &traits::ChannelMessage,
+    is_admin: Option<bool>,
+    external_network_command_mode: OneBotCommandExternalNetworkAccess,
+    external_network_command_allowed: bool,
+    blocked_tools: &HashSet<String>,
+) -> Option<String> {
     if msg.channel != "onebot_v11" {
         return None;
     }
@@ -287,6 +403,32 @@ fn channel_sender_context(msg: &traits::ChannelMessage) -> Option<String> {
     if let Some(name) = msg.sender_name.as_deref().filter(|s| !s.trim().is_empty()) {
         lines.push(format!("对方昵称：{name}"));
     }
+
+    if let Some(is_admin) = is_admin {
+        if is_admin {
+            lines.push("权限身份：管理员（可使用管理员专属工具）".to_string());
+        } else {
+            lines.push("权限身份：非管理员（管理员专属工具将被系统拒绝）".to_string());
+            if !blocked_tools.is_empty() {
+                let mut tools: Vec<String> = blocked_tools.iter().cloned().collect();
+                tools.sort();
+                lines.push(format!("已禁用工具：{}", tools.join(", ")));
+            }
+        }
+    }
+
+    let shell_network_status = match external_network_command_mode {
+        OneBotCommandExternalNetworkAccess::Off => "关闭",
+        OneBotCommandExternalNetworkAccess::On => "开启",
+        OneBotCommandExternalNetworkAccess::AdminOnly => {
+            if external_network_command_allowed {
+                "仅管理员（当前可用）"
+            } else {
+                "仅管理员（当前不可用）"
+            }
+        }
+    };
+    lines.push(format!("命令外网访问：{shell_network_status}"));
 
     Some(format!("【对话信息】\n{}\n【/对话信息】", lines.join("\n")))
 }
@@ -358,9 +500,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
 
     let memory_context = build_memory_context(ctx.memory.as_ref(), &msg.content).await;
 
-    let history_limit = ctx
-        .max_history_messages
-        .min(CHANNEL_MAX_HISTORY_MESSAGES);
+    let history_limit = ctx.max_history_messages.min(CHANNEL_MAX_HISTORY_MESSAGES);
     let conversation_history = if ctx.auto_save_memory {
         load_conversation_history(ctx.memory.as_ref(), &session_id, history_limit).await
     } else {
@@ -408,13 +548,44 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
 
+    let sender_is_admin = is_onebot_admin_sender(&msg, ctx.onebot_admin_users.as_ref());
+    let onebot_policy_enabled = msg.channel == "onebot_v11" && !ctx.onebot_admin_users.is_empty();
+    let external_network_command_allowed = onebot_external_network_command_allowed(
+        &msg.channel,
+        ctx.onebot_command_external_network_access,
+        sender_is_admin,
+    );
+
+    let blocked_tools = blocked_tools_for_sender(
+        &msg,
+        sender_is_admin,
+        ctx.onebot_admin_users.as_ref(),
+        ctx.onebot_admin_only_tools.as_ref(),
+    );
+    let blocked_tools_ref = if blocked_tools.is_empty() {
+        None
+    } else {
+        Some(&blocked_tools)
+    };
+
     let system_prompt = compose_system_prompt_for_channel(ctx.system_prompt.as_str(), &msg.channel);
 
     let mut history = Vec::with_capacity(2 + conversation_history.len());
     history.push(ChatMessage::system(system_prompt.as_ref()));
     history.extend(conversation_history);
-    if let Some(sender_ctx) = channel_sender_context(&msg) {
+    if let Some(sender_ctx) = channel_sender_context(
+        &msg,
+        onebot_policy_enabled.then_some(sender_is_admin),
+        ctx.onebot_command_external_network_access,
+        external_network_command_allowed,
+        &blocked_tools,
+    ) {
         history.push(ChatMessage::system(sender_ctx));
+    }
+    if let Some(non_admin_ctx) =
+        build_non_admin_context_message(ctx.as_ref(), &msg, sender_is_admin, &blocked_tools)
+    {
+        history.push(ChatMessage::system(non_admin_ctx));
     }
     history.push(ChatMessage::user(&enriched_message));
 
@@ -432,6 +603,8 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             None,
             msg.channel.as_str(),
             ctx.max_tool_iterations,
+            blocked_tools_ref,
+            external_network_command_allowed,
         ),
     )
     .await;
@@ -1220,10 +1393,18 @@ pub async fn start_channels(config: Config) -> Result<()> {
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
+    let onebot_command_external_network_access = config
+        .channels_config
+        .onebot_v11
+        .as_ref()
+        .map(|cfg| cfg.command_external_network_access)
+        .unwrap_or_default();
+    let mut security_policy = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+    security_policy.allow_external_network_commands = !matches!(
+        onebot_command_external_network_access,
+        OneBotCommandExternalNetworkAccess::Off
+    );
+    let security = Arc::new(security_policy);
     let model = config
         .default_model
         .clone()
@@ -1516,8 +1697,42 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
 
+    let (onebot_admin_users, onebot_admin_only_tools, onebot_non_admin_context_file) = config
+        .channels_config
+        .onebot_v11
+        .as_ref()
+        .map(|cfg| {
+            let admins = cfg
+                .admin_users
+                .iter()
+                .map(|entry| entry.trim().to_string())
+                .filter(|entry| !entry.is_empty())
+                .collect::<Vec<_>>();
+            let tools = cfg
+                .admin_only_tools
+                .iter()
+                .map(|name| normalize_tool_policy_name(name))
+                .filter(|name| !name.is_empty())
+                .collect::<HashSet<_>>();
+            let context_file = cfg.non_admin_context_file.trim().to_string();
+            let context_file = if context_file.is_empty() {
+                DEFAULT_NON_ADMIN_CONTEXT_FILE.to_string()
+            } else {
+                context_file
+            };
+            (admins, tools, context_file)
+        })
+        .unwrap_or_else(|| {
+            (
+                vec![],
+                HashSet::new(),
+                DEFAULT_NON_ADMIN_CONTEXT_FILE.to_string(),
+            )
+        });
+
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
+        workspace_dir: Arc::new(workspace),
         provider: Arc::clone(&provider),
         memory: Arc::clone(&mem),
         tools_registry: Arc::clone(&tools_registry),
@@ -1529,6 +1744,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         max_tool_iterations: config.agent.max_tool_iterations,
         max_history_messages: config.agent.max_history_messages,
         isolate_channel_conversations: config.agent.isolate_channel_conversations,
+        onebot_admin_users: Arc::new(onebot_admin_users),
+        onebot_admin_only_tools: Arc::new(onebot_admin_only_tools),
+        onebot_non_admin_context_file: Arc::new(onebot_non_admin_context_file),
+        onebot_command_external_network_access,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -1622,6 +1841,35 @@ mod tests {
         };
 
         assert_eq!(conversation_session_id(&msg, false), "onebot_v11:global");
+    }
+
+    #[test]
+    fn onebot_external_network_command_access_mode_honors_admin_policy() {
+        assert!(!onebot_external_network_command_allowed(
+            "discord",
+            OneBotCommandExternalNetworkAccess::On,
+            true
+        ));
+        assert!(!onebot_external_network_command_allowed(
+            "onebot_v11",
+            OneBotCommandExternalNetworkAccess::Off,
+            true
+        ));
+        assert!(onebot_external_network_command_allowed(
+            "onebot_v11",
+            OneBotCommandExternalNetworkAccess::On,
+            false
+        ));
+        assert!(onebot_external_network_command_allowed(
+            "onebot_v11",
+            OneBotCommandExternalNetworkAccess::AdminOnly,
+            true
+        ));
+        assert!(!onebot_external_network_command_allowed(
+            "onebot_v11",
+            OneBotCommandExternalNetworkAccess::AdminOnly,
+            false
+        ));
     }
 
     #[derive(Default)]
@@ -1806,6 +2054,11 @@ mod tests {
             max_tool_iterations: 10,
             max_history_messages: 0,
             isolate_channel_conversations: true,
+            workspace_dir: Arc::new(std::path::PathBuf::from(".")),
+            onebot_admin_users: Arc::new(vec![]),
+            onebot_admin_only_tools: Arc::new(std::collections::HashSet::new()),
+            onebot_non_admin_context_file: Arc::new(DEFAULT_NON_ADMIN_CONTEXT_FILE.to_string()),
+            onebot_command_external_network_access: OneBotCommandExternalNetworkAccess::Off,
         });
 
         process_channel_message(
@@ -1851,6 +2104,11 @@ mod tests {
             max_tool_iterations: 10,
             max_history_messages: 0,
             isolate_channel_conversations: true,
+            workspace_dir: Arc::new(std::path::PathBuf::from(".")),
+            onebot_admin_users: Arc::new(vec![]),
+            onebot_admin_only_tools: Arc::new(std::collections::HashSet::new()),
+            onebot_non_admin_context_file: Arc::new(DEFAULT_NON_ADMIN_CONTEXT_FILE.to_string()),
+            onebot_command_external_network_access: OneBotCommandExternalNetworkAccess::Off,
         });
 
         process_channel_message(
@@ -1950,6 +2208,11 @@ mod tests {
             max_tool_iterations: 10,
             max_history_messages: 0,
             isolate_channel_conversations: true,
+            workspace_dir: Arc::new(std::path::PathBuf::from(".")),
+            onebot_admin_users: Arc::new(vec![]),
+            onebot_admin_only_tools: Arc::new(std::collections::HashSet::new()),
+            onebot_non_admin_context_file: Arc::new(DEFAULT_NON_ADMIN_CONTEXT_FILE.to_string()),
+            onebot_command_external_network_access: OneBotCommandExternalNetworkAccess::Off,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
