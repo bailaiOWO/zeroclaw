@@ -2,7 +2,7 @@ const pageTitles = {
   dashboard:'仪表盘', chat:'对话', history:'聊天记录', channels:'消息平台',
   providers:'模型与路由', config:'更多配置', settings:'设置', 
   identity:'身份设定', cron:'定时任务',
-  'context-files':'上下文文件'
+  'context-files':'上下文链路'
 };
 let currentTab = 'dashboard';
 let contextAutoRefreshEnabled = false;
@@ -293,7 +293,8 @@ function str2arr(str){ return (str||'').split(',').map(s=>s.trim()).filter(Boole
 let _rawConfig = null;
 let _providerModelCandidates = {};
 let _providerModelStatus = {};
-let currentContextFile = '';
+let currentContextVariant = 'non_admin';
+let _contextFlowData = null;
 
 async function loadStatus(){
   try{
@@ -385,7 +386,7 @@ const ALL_CHANNELS = [
   {key:'discord',  name:'Discord', icon:'headset_mic', desc:'Discord Bot', schema:{bot_token:'str',guild_id:'str',allowed_users:'arr',listen_to_bots:'bool',mention_only:'bool'}},
   {key:'slack',    name:'Slack', icon:'tag', desc:'Slack Bot', schema:{bot_token:'str',app_token:'str',channel_id:'str',allowed_users:'arr'}},
   {key:'qq',       name:'QQ Official', icon:'smart_toy', desc:'QQ 官方机器人', schema:{app_id:'str',app_secret:'str',allowed_users:'arr'}},
-  {key:'onebot_v11', name:'NapCat / OneBot v11', icon:'hub', desc:'NapCat 作为 OneBot v11 接入', schema:{api_url:'str',access_token:'str',listen_host:'str',listen_port:'num',allowed_users:'arr',allowed_groups:'arr',require_at_in_group:'bool',admin_users:'arr',admin_only_tools:'arr',command_external_network_access:'str',non_admin_context_file:'str'}},
+  {key:'onebot_v11', name:'NapCat / OneBot v11', icon:'hub', desc:'NapCat 作为 OneBot v11 接入', schema:{api_url:'str',access_token:'str',listen_host:'str',listen_port:'num',allowed_users:'arr',allowed_groups:'arr',require_at_in_group:'bool',admin_users:'arr',admin_only_tools:'arr',command_external_network_access:'str',non_admin_context_file:'str',message_merge_window_secs:'num',interrupt_on_recall:'bool',vision_input_enabled:'bool',friend_request_notify_mode:'str',friend_request_notify_targets:'arr'}},
   {key:'webhook',  name:'Webhook', icon:'webhook', desc:'HTTP 回调接口', schema:{port:'num',secret:'str'}},
   {key:'whatsapp', name:'WhatsApp', icon:'chat', desc:'Meta Business API', schema:{access_token:'str',phone_number_id:'str',verify_token:'str',app_secret:'str',allowed_numbers:'arr'}},
   {key:'lark',     name:'飞书 / Lark', icon:'apartment', desc:'飞书开放平台', schema:{app_id:'str',app_secret:'str',encrypt_key:'str',verification_token:'str',allowed_users:'arr',use_feishu:'bool',receive_mode:'str',port:'num'}},
@@ -393,11 +394,44 @@ const ALL_CHANNELS = [
   {key:'cli',      name:'CLI 终端', icon:'terminal', desc:'启用命令行交互通道', schema:{}},
 ];
 
-const CH_DICT = {bot_token:'机器人 Token', allowed_users:'授权用户ID (逗号分隔)', guild_id:'服务器 ID (Guild)', listen_to_bots:'监听其他机器人', mention_only:'仅响应@提及', app_token:'App Token', channel_id:'频道 ID', app_id:'应用 ID', app_secret:'应用密钥', port:'监听端口', secret:'密钥 (可选)', access_token:'访问令牌', phone_number_id:'电话号码ID', verify_token:'验证令牌', allowed_numbers:'授权电话号码', encrypt_key:'加密密钥', verification_token:'事件订阅Token', use_feishu:'使用飞书(而非Lark)', receive_mode:'接收模式(websocket/webhook)', client_id:'Client ID', client_secret:'Client Secret', api_url:'OneBot API 地址', listen_host:'回调监听地址', listen_port:'回调监听端口', allowed_groups:'授权群号 (逗号分隔，可空=全部)', require_at_in_group:'群聊仅响应@机器人', admin_users:'管理员QQ (逗号分隔)', admin_only_tools:'仅管理员可用工具 (逗号分隔)', command_external_network_access:'命令外网访问策略', non_admin_context_file:'非管理员上下文文件路径'};
+const CH_DICT = {bot_token:'机器人 Token', allowed_users:'授权用户ID (逗号分隔)', guild_id:'服务器 ID (Guild)', listen_to_bots:'监听其他机器人', mention_only:'仅响应@提及', app_token:'App Token', channel_id:'频道 ID', app_id:'应用 ID', app_secret:'应用密钥', port:'监听端口', secret:'密钥 (可选)', access_token:'访问令牌', phone_number_id:'电话号码ID', verify_token:'验证令牌', allowed_numbers:'授权电话号码', encrypt_key:'加密密钥', verification_token:'事件订阅Token', use_feishu:'使用飞书(而非Lark)', receive_mode:'接收模式(websocket/webhook)', client_id:'Client ID', client_secret:'Client Secret', api_url:'OneBot API 地址', listen_host:'回调监听地址', listen_port:'回调监听端口', allowed_groups:'授权群号 (逗号分隔，可空=全部)', require_at_in_group:'群聊仅响应@机器人', admin_users:'管理员QQ (逗号分隔)', admin_only_tools:'仅管理员可用工具 (逗号分隔)', command_external_network_access:'命令外网访问策略', non_admin_context_file:'非管理员上下文文件路径', message_merge_window_secs:'连续消息合并窗口(秒，0=关闭)', interrupt_on_recall:'撤回时打断 AI 回复', vision_input_enabled:'视觉输入开关（仅视觉模型可启用）', friend_request_notify_mode:'好友申请通知对象', friend_request_notify_targets:'好友申请通知QQ (逗号分隔)'};
+
+function modelRouteVisionFlag(cfg, modelName){
+  const model = String(modelName||'').trim();
+  if(!model) return null;
+  const routes = Array.isArray(cfg?.model_routes) ? cfg.model_routes : [];
+  if(model.toLowerCase().startsWith('hint:')){
+    const hint = model.slice(5).trim().toLowerCase();
+    const matched = routes.find(r=>String(r?.hint||'').trim().toLowerCase()===hint);
+    if(matched && typeof matched.vision === 'boolean') return !!matched.vision;
+    return null;
+  }
+  const matched = routes.find(r=>String(r?.model||'').trim().toLowerCase()===model.toLowerCase());
+  if(matched && typeof matched.vision === 'boolean') return !!matched.vision;
+  return null;
+}
+
+function looksLikeVisionModelName(modelName){
+  const model = String(modelName||'').trim().toLowerCase();
+  if(!model) return false;
+  return [
+    'vision', '-vl', 'gpt-4o', 'gpt-4.1', 'gemini',
+    'claude-3', 'claude-sonnet-4', 'qwen-vl', 'glm-4v',
+    'minicpm', 'llava'
+  ].some(token=>model.includes(token));
+}
+
+function onebotVisionModelEnabled(cfg){
+  const model = String(cfg?.default_model || '').trim();
+  if(!model) return false;
+  const routeFlag = modelRouteVisionFlag(cfg, model);
+  return routeFlag==null ? looksLikeVisionModelName(model) : !!routeFlag;
+}
 
 
 function renderChannels(cfg){
   const chs = cfg.channels_config||{};
+  const onebotVisionModelReady = onebotVisionModelEnabled(cfg);
   const box=document.getElementById('channels-list');
   box.innerHTML='';
   for(const c of ALL_CHANNELS){
@@ -444,6 +478,22 @@ function renderChannels(cfg){
             <option value="on" ${mode==='on'?'selected':''}>开启（允许所有 OneBot 会话）</option>
             <option value="admin_only" ${mode==='admin_only'?'selected':''}>仅管理员</option>
           </select>`;
+      } else if(c.key==='onebot_v11' && k==='friend_request_notify_mode'){
+        const mode = (val || 'all_admins').toString();
+        fg.innerHTML=`<label>${esc(label)}</label>
+          <select class="form-input" data-path="channels_config.${c.key}.${k}">
+            <option value="all_admins" ${mode==='all_admins'?'selected':''}>通知所有管理员（admin_users）</option>
+            <option value="specific_accounts" ${mode==='specific_accounts'?'selected':''}>仅通知指定 QQ 列表</option>
+          </select>`;
+      } else if(c.key==='onebot_v11' && k==='vision_input_enabled'){
+        if(!onebotVisionModelReady && val){
+          val = false;
+          data[k] = false;
+        }
+        fg.innerHTML=`<label class="checkbox-field"><input type="checkbox" data-path="channels_config.${c.key}.${k}" ${val?'checked':''} ${onebotVisionModelReady?'':'disabled'}> <span>${esc(label)}</span></label>
+          <div class="field-hint">${onebotVisionModelReady
+            ? '当前默认模型已标记为视觉模型，可接收图片输入并拼接到提示词。'
+            : '当前默认模型未标记为视觉模型，请先在模型路由中将对应模型勾选“视觉模型”后再开启。'}</div>`;
       } else if(type==='bool'){
         fg.innerHTML=`<label class="checkbox-field"><input type="checkbox" data-path="channels_config.${c.key}.${k}" ${val?'checked':''}> <span>${esc(label)}</span></label>`;
       }else{
@@ -479,6 +529,12 @@ window.toggleChannel = function(el, key, checked){
              _rawConfig.channels_config.onebot_v11.admin_only_tools = [];
              _rawConfig.channels_config.onebot_v11.command_external_network_access = 'off';
              _rawConfig.channels_config.onebot_v11.non_admin_context_file = 'NON_ADMIN.md';
+             _rawConfig.channels_config.onebot_v11.message_merge_window_secs = 10;
+             _rawConfig.channels_config.onebot_v11.interrupt_on_recall = true;
+             _rawConfig.channels_config.onebot_v11.vision_input_enabled = false;
+             _rawConfig.channels_config.onebot_v11.friend_request_notify_mode = 'all_admins';
+             _rawConfig.channels_config.onebot_v11.friend_request_notify_targets = [];
+
          }
 
       }
@@ -596,6 +652,7 @@ function renderProviders(cfg){
       <input class="form-input" placeholder="Hint (任务)" data-path="model_routes.${i}.hint" value="${esc(r.hint)}">
       <input class="form-input" placeholder="Provider (渠道)" data-path="model_routes.${i}.provider" value="${esc(r.provider)}">
       <input class="form-input" placeholder="Model (模型)" data-path="model_routes.${i}.model" value="${esc(r.model)}">
+      <label class="checkbox-field" style="margin:0;white-space:nowrap;"><input type="checkbox" data-path="model_routes.${i}.vision" ${r.vision?'checked':''}> <span>视觉模型</span></label>
       <button class="btn btn-error btn-sm" onclick="_rawConfig.model_routes.splice(${i},1);renderProviders(_rawConfig)">删除</button>
     `;
     mb.appendChild(el);
@@ -670,7 +727,7 @@ window.applyDiscoveredModel = function(providerId, model){
 
 window.addModelRoute = function(){
   if(!_rawConfig.model_routes) _rawConfig.model_routes=[];
-  _rawConfig.model_routes.push({hint:'',provider:'',model:''});
+  _rawConfig.model_routes.push({hint:'',provider:'',model:'',vision:false});
   renderProviders(_rawConfig);
 };
 
@@ -933,7 +990,11 @@ window.toggleContextAutoRefresh = function(enabled){
 window.refreshContextFiles = function(){ loadContextFiles(); };
 
 window.copyCurrentContextFile = async function(){
-  const text = document.getElementById('context-file-content')?.textContent || '';
+  const variant = getCurrentContextVariantData();
+  const text = (variant?.cards||[]).map((card, idx)=>{
+    const no = card.order || (idx+1);
+    return `# ${no}. ${card.title||'未命名片段'}\n来源: ${card.source||'—'}\n条件: ${card.condition||'—'}\n角色: ${card.role||'—'}\n\n${card.content||''}`;
+  }).join('\n\n---\n\n');
   if(!text) return;
   try{
     await navigator.clipboard.writeText(text);
@@ -943,32 +1004,139 @@ window.copyCurrentContextFile = async function(){
   }
 };
 
-async function loadContextFiles(){
-  try{
-    const query = currentContextFile ? `?file=${encodeURIComponent(currentContextFile)}` : '';
-    const r = await fetch('/api/context-files'+query);
-    if(!r.ok) throw new Error(await r.text());
-    const d = await r.json();
-    currentContextFile = d.selected || currentContextFile;
+window.setContextVariant = function(variant){
+  currentContextVariant = variant || currentContextVariant || 'non_admin';
+  renderContextFlow();
+};
 
-    const list = document.getElementById('context-files-list');
-    list.innerHTML = '';
-    for(const f of (d.files||[])){
-      const item = document.createElement('button');
-      item.className = 'context-file-item'+(f.id===d.selected?' active':'');
-      const badges = [f.active_in_prompt ? '注入中' : '未注入', f.exists ? '存在' : '缺失', f.is_virtual ? '虚拟' : '文件'];
-      item.innerHTML = `<div>${esc(f.label)}</div><div class="context-file-sub">${esc(f.path)} · ${badges.join(' / ')}</div>`;
-      item.onclick = ()=>{ currentContextFile = f.id; loadContextFiles(); };
-      list.appendChild(item);
+function getCurrentContextVariantData(){
+  const variants = Array.isArray(_contextFlowData?.flow_variants) ? _contextFlowData.flow_variants : [];
+  if(!variants.length) return null;
+  let selected = variants.find(v=>v.id===currentContextVariant);
+  if(!selected){
+    const fallback = _contextFlowData?.flow_default_variant || variants[0].id;
+    selected = variants.find(v=>v.id===fallback) || variants[0];
+    currentContextVariant = selected?.id || currentContextVariant;
+  }
+  return selected;
+}
+
+function renderContextVariantTabs(){
+  const tabs = document.getElementById('context-variant-tabs');
+  if(!tabs) return;
+  const variants = Array.isArray(_contextFlowData?.flow_variants) ? _contextFlowData.flow_variants : [];
+  tabs.innerHTML = '';
+  for(const variant of variants){
+    const btn = document.createElement('button');
+    btn.className = 'seg'+(variant.id===currentContextVariant?' active':'');
+    btn.textContent = variant.label || variant.id;
+    btn.onclick = ()=>window.setContextVariant(variant.id);
+    tabs.appendChild(btn);
+  }
+}
+
+function renderContextFlow(){
+  const flow = document.getElementById('context-flow');
+  if(!flow) return;
+
+  renderContextVariantTabs();
+  const variant = getCurrentContextVariantData();
+  if(!variant){
+    flow.innerHTML = '<div class="empty-state compact"><p>暂无上下文流程数据</p></div>';
+    const meta = document.getElementById('context-selected-meta');
+    if(meta) meta.textContent = '—';
+    return;
+  }
+
+  const cards = Array.isArray(variant.cards) ? variant.cards : [];
+  const meta = document.getElementById('context-selected-meta');
+  if(meta){
+    meta.textContent = `当前视图：${variant.label||variant.id} · 共 ${cards.length} 个片段`;
+  }
+
+  flow.innerHTML = '';
+  if(!cards.length){
+    flow.innerHTML = '<div class="empty-state compact"><p>当前状态暂无可展示卡片</p></div>';
+    return;
+  }
+
+  cards.forEach((card, idx)=>{
+    const item = document.createElement('article');
+    item.className = 'context-flow-card'+(idx===0?' expanded':'');
+    item.innerHTML = `
+      <div class="context-flow-header" role="button" tabindex="0" aria-expanded="${idx===0?'true':'false'}">
+        <div class="context-flow-order">${esc(String(card.order||idx+1))}</div>
+        <div class="context-flow-main">
+          <div class="context-flow-title">${esc(card.title||'未命名片段')}</div>
+          <div class="context-flow-subtitle">${esc(card.subtitle||'')}</div>
+          <div class="context-flow-meta">角色 ${esc(card.role||'—')} · 条件 ${esc(card.condition||'—')}</div>
+        </div>
+        <span class="material-symbols-outlined chevron-icon">expand_more</span>
+      </div>
+      <div class="context-flow-body-wrapper">
+        <div class="context-flow-body">
+          <pre class="context-flow-content">${esc(card.content||'')}</pre>
+          <div class="context-flow-source">来源：${esc(card.source||'—')}</div>
+        </div>
+      </div>
+    `;
+
+    const header = item.querySelector('.context-flow-header');
+    const toggle = ()=>{
+      const expanded = item.classList.toggle('expanded');
+      if(header) header.setAttribute('aria-expanded', expanded?'true':'false');
+    };
+    if(header){
+      header.addEventListener('click', toggle);
+      header.addEventListener('keydown', (evt)=>{
+        if(evt.key==='Enter' || evt.key===' '){
+          evt.preventDefault();
+          toggle();
+        }
+      });
     }
 
-    const selectedMeta = (d.files||[]).find(f=>f.id===d.selected);
-    document.getElementById('context-selected-name').textContent = selectedMeta ? selectedMeta.label : '未选择文件';
-    document.getElementById('context-selected-meta').textContent = selectedMeta
-      ? `${selectedMeta.path} · ${selectedMeta.exists?'存在':'缺失'} · ${fmtBytes(selectedMeta.size_bytes)} · 修改时间 ${fmtUnix(selectedMeta.modified_unix)}`
-      : '—';
+    flow.appendChild(item);
+    if(idx < cards.length-1){
+      const arrow = document.createElement('div');
+      arrow.className = 'context-flow-arrow';
+      arrow.innerHTML = '<span class="material-symbols-outlined">south</span>';
+      flow.appendChild(arrow);
+    }
+  });
+}
+
+async function loadContextFiles(){
+  try{
+    const r = await fetch('/api/context-files');
+    if(!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+
+    if(!Array.isArray(d.flow_variants) || !d.flow_variants.length){
+      d.flow_variants = [{
+        id:'default',
+        label:'默认',
+        cards:[{
+          id:'legacy-context',
+          order:1,
+          title:'上下文文件内容',
+          subtitle:'旧接口兼容视图',
+          source:(d.selected||'context-files'),
+          condition:'always',
+          role:'system',
+          content:d.content||''
+        }]
+      }];
+      d.flow_default_variant = 'default';
+    }
+
+    _contextFlowData = d;
+    if(!currentContextVariant || !(d.flow_variants||[]).some(v=>v.id===currentContextVariant)){
+      currentContextVariant = d.flow_default_variant || d.flow_variants?.[0]?.id || 'non_admin';
+    }
+
     document.getElementById('context-mode').textContent = d.mode==='aieos' ? 'AIEOS' : 'OpenClaw';
-    document.getElementById('context-file-content').textContent = d.content || '';
+    renderContextFlow();
 
     const notes = document.getElementById('context-notes');
     notes.innerHTML = (d.notes||[]).map(n=>`<div class="context-note">${esc(n)}</div>`).join('');
@@ -976,8 +1144,8 @@ async function loadContextFiles(){
     const autoRefresh = document.getElementById('context-auto-refresh');
     if(autoRefresh) autoRefresh.checked = contextAutoRefreshEnabled;
   }catch(e){
-    const content = document.getElementById('context-file-content');
-    if(content) content.textContent = `加载失败: ${e.message||e}`;
+    const flow = document.getElementById('context-flow');
+    if(flow) flow.innerHTML = `<div class="empty-state compact"><p>加载失败: ${esc(e.message||String(e))}</p></div>`;
   }
 }
 
@@ -1674,6 +1842,11 @@ function applyOnboardToRawConfig(){
       admin_only_tools: Array.isArray(prev.admin_only_tools) ? prev.admin_only_tools : [],
       command_external_network_access: (document.getElementById('ob-onebot-net-access')?.value || prev.command_external_network_access || 'off').trim() || 'off',
       non_admin_context_file: (prev.non_admin_context_file || 'NON_ADMIN.md').trim() || 'NON_ADMIN.md',
+      message_merge_window_secs: Number(prev.message_merge_window_secs ?? 10) || 10,
+      interrupt_on_recall: prev.interrupt_on_recall !== false,
+      vision_input_enabled: !!prev.vision_input_enabled && onebotVisionModelEnabled(_rawConfig),
+      friend_request_notify_mode: (prev.friend_request_notify_mode || 'all_admins').trim() || 'all_admins',
+      friend_request_notify_targets: Array.isArray(prev.friend_request_notify_targets) ? prev.friend_request_notify_targets : [],
     };
   }
 

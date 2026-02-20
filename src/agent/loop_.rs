@@ -1260,6 +1260,21 @@ pub async fn run(
         "schedule",
         "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
     ));
+    if config.channels_config.onebot_v11.is_some() {
+        tool_descs.push((
+            "onebot_contact_search",
+            "Search QQ contacts/groups via OneBot v11 by QQ号、昵称、群名、备注，并返回可直接发送的 reply_target。",
+        ));
+        tool_descs.push((
+            "onebot_send_to",
+            "Send QQ message/files to a specific target via OneBot v11. target 支持 private:QQ号 / group:群号 / QQ号 / 昵称关键词；若匹配多个会返回候选。",
+        ));
+        tool_descs.push((
+            "onebot_friend_request_approve",
+            "Approve/reject QQ friend requests via OneBot v11.",
+        ));
+    }
+
     if !config.agents.is_empty() {
         tool_descs.push((
             "delegate",
@@ -1650,6 +1665,20 @@ pub async fn process_message_with_session(
     }
     if config.composio.enabled {
         tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
+    }
+    if config.channels_config.onebot_v11.is_some() {
+        tool_descs.push((
+            "onebot_contact_search",
+            "Search QQ contacts/groups via OneBot v11 by QQ号、昵称、群名、备注。",
+        ));
+        tool_descs.push((
+            "onebot_send_to",
+            "Send QQ message/files via OneBot v11 by private/group target or nickname search.",
+        ));
+        tool_descs.push((
+            "onebot_friend_request_approve",
+            "Approve/reject QQ friend requests via OneBot v11.",
+        ));
     }
     if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
         tool_descs.push(("gpio_read", "Read GPIO pin value on connected hardware."));

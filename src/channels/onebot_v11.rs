@@ -1,4 +1,5 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use crate::config::OneBotFriendRequestNotifyMode;
 use crate::security::pairing::constant_time_eq;
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
@@ -18,6 +19,10 @@ use uuid::Uuid;
 
 const DEFAULT_CALLBACK_PATH: &str = "/onebot/v11";
 const DEDUP_CAPACITY: usize = 10_000;
+pub(crate) const ONEBOT_CONTROL_RECALL_PREFIX: &str = "[[onebot_control:recall]]";
+const ONEBOT_EVENT_POKE_PREFIX: &str = "[[onebot_event:poke]]";
+const ONEBOT_EVENT_FRIEND_REQUEST_PREFIX: &str = "[[onebot_event:friend_request]]";
+const ONEBOT_EVENT_NOTE_SUFFIX: &str = "（系统事件）";
 
 /// OneBot v11 channel (NapCat / go-cqhttp compatible).
 ///
@@ -32,6 +37,9 @@ pub struct OneBotV11Channel {
     allowed_groups: Vec<String>,
     require_at_in_group: bool,
     client: reqwest::Client,
+    admin_users: Vec<String>,
+    friend_request_notify_mode: OneBotFriendRequestNotifyMode,
+    friend_request_notify_targets: Vec<String>,
     dedup: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -53,6 +61,9 @@ impl OneBotV11Channel {
             allowed_groups: config.allowed_groups,
             require_at_in_group: config.require_at_in_group,
             client: reqwest::Client::new(),
+            admin_users: config.admin_users,
+            friend_request_notify_mode: config.friend_request_notify_mode,
+            friend_request_notify_targets: config.friend_request_notify_targets,
             dedup: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -87,7 +98,7 @@ impl OneBotV11Channel {
         false
     }
 
-    fn parse_event(&self, event: OneBotEvent) -> Option<ChannelMessage> {
+    fn parse_message_event(&self, event: OneBotEvent) -> Option<ChannelMessage> {
         if event.post_type != "message" {
             return None;
         }
@@ -167,6 +178,198 @@ impl OneBotV11Channel {
             channel: "onebot_v11".to_string(),
             timestamp: event.time.unwrap_or_else(now_unix_secs),
         })
+    }
+
+    fn parse_notice_event(&self, event: OneBotEvent) -> Vec<ChannelMessage> {
+        let notice_type = event.notice_type.trim().to_ascii_lowercase();
+        match notice_type.as_str() {
+            "notify" if event.sub_type.trim().eq_ignore_ascii_case("poke") => {
+                let sender = match event.user_id {
+                    Some(value) => value.to_string(),
+                    None => return Vec::new(),
+                };
+                if !self.is_user_allowed(&sender) {
+                    tracing::warn!("OneBot v11: ignoring poke from unauthorized user: {sender}");
+                    return Vec::new();
+                }
+
+                let self_id = event.self_id.as_ref().and_then(json_value_to_string);
+                if let (Some(target_id), Some(self_id)) = (event.target_id, self_id.as_deref()) {
+                    if target_id.to_string() != self_id {
+                        return Vec::new();
+                    }
+                }
+
+                let (reply_target, summary) =
+                    if let Some(group_id) = event.group_id.map(|v| v.to_string()) {
+                        if !self.is_group_allowed(&group_id) {
+                            tracing::warn!(
+                                "OneBot v11: ignoring poke in unauthorized group: {group_id}"
+                            );
+                            return Vec::new();
+                        }
+                        (
+                            format!("group:{group_id}"),
+                            format!("用户 {sender} 在群 {group_id} 戳了你一下"),
+                        )
+                    } else {
+                        (
+                            format!("private:{sender}"),
+                            format!("用户 {sender} 在私聊里戳了你一下"),
+                        )
+                    };
+
+                vec![ChannelMessage {
+                    id: event
+                        .message_id
+                        .as_ref()
+                        .and_then(json_value_to_string)
+                        .unwrap_or_else(|| Uuid::new_v4().to_string()),
+                    sender,
+                    sender_name: Some(format!("戳一戳{ONEBOT_EVENT_NOTE_SUFFIX}")),
+                    reply_target,
+                    content: format!("{ONEBOT_EVENT_POKE_PREFIX} {summary}，请直接回复对方。"),
+                    channel: "onebot_v11".to_string(),
+                    timestamp: event.time.unwrap_or_else(now_unix_secs),
+                }]
+            }
+            "friend_recall" => {
+                let sender = match event.user_id {
+                    Some(value) => value.to_string(),
+                    None => return Vec::new(),
+                };
+                if !self.is_user_allowed(&sender) {
+                    return Vec::new();
+                }
+                let recalled_id = event
+                    .message_id
+                    .as_ref()
+                    .and_then(json_value_to_string)
+                    .unwrap_or_default();
+                vec![ChannelMessage {
+                    id: format!("friend_recall:{}:{}", sender, recalled_id),
+                    sender: sender.clone(),
+                    sender_name: Some(format!("撤回事件{ONEBOT_EVENT_NOTE_SUFFIX}")),
+                    reply_target: format!("private:{sender}"),
+                    content: format!(
+                        "{ONEBOT_CONTROL_RECALL_PREFIX} recalled_message_id={recalled_id}"
+                    ),
+                    channel: "onebot_v11".to_string(),
+                    timestamp: event.time.unwrap_or_else(now_unix_secs),
+                }]
+            }
+            "group_recall" => {
+                let sender = match event.user_id {
+                    Some(value) => value.to_string(),
+                    None => return Vec::new(),
+                };
+                let group_id = match event.group_id {
+                    Some(value) => value.to_string(),
+                    None => return Vec::new(),
+                };
+                if !self.is_group_allowed(&group_id) {
+                    return Vec::new();
+                }
+                let recalled_id = event
+                    .message_id
+                    .as_ref()
+                    .and_then(json_value_to_string)
+                    .unwrap_or_default();
+                let operator = event
+                    .operator_id
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                vec![ChannelMessage {
+                    id: format!("group_recall:{group_id}:{recalled_id}"),
+                    sender,
+                    sender_name: Some(format!("撤回事件{ONEBOT_EVENT_NOTE_SUFFIX}")),
+                    reply_target: format!("group:{group_id}"),
+                    content: format!(
+                        "{ONEBOT_CONTROL_RECALL_PREFIX} recalled_message_id={recalled_id} operator_id={operator}"
+                    ),
+                    channel: "onebot_v11".to_string(),
+                    timestamp: event.time.unwrap_or_else(now_unix_secs),
+                }]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn friend_request_notice_recipients(&self) -> Vec<String> {
+        let source = match self.friend_request_notify_mode {
+            OneBotFriendRequestNotifyMode::AllAdmins => &self.admin_users,
+            OneBotFriendRequestNotifyMode::SpecificAccounts => &self.friend_request_notify_targets,
+        };
+
+        let mut dedup = HashSet::new();
+        source
+            .iter()
+            .map(|entry| entry.trim())
+            .filter(|entry| !entry.is_empty() && *entry != "*")
+            .filter(|entry| dedup.insert((*entry).to_string()))
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    fn parse_request_event(&self, event: OneBotEvent) -> Vec<ChannelMessage> {
+        if !event.request_type.trim().eq_ignore_ascii_case("friend") {
+            return Vec::new();
+        }
+
+        let applicant_id = match event.user_id {
+            Some(value) => value.to_string(),
+            None => return Vec::new(),
+        };
+
+        let flag = event
+            .flag
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default()
+            .to_string();
+
+        if flag.is_empty() {
+            tracing::warn!("OneBot v11: friend request missing flag");
+            return Vec::new();
+        }
+
+        if self.is_duplicate(&format!("friend_request:{flag}")) {
+            return Vec::new();
+        }
+
+        let recipients = self.friend_request_notice_recipients();
+        if recipients.is_empty() {
+            tracing::warn!("OneBot v11: no admin recipients configured for friend request notices");
+            return Vec::new();
+        }
+
+        let comment = event.comment.unwrap_or_default();
+        let ts = event.time.unwrap_or_else(now_unix_secs);
+        recipients
+            .into_iter()
+            .map(|admin_id| ChannelMessage {
+                id: format!("friend_request_notice:{flag}:{admin_id}"),
+                sender: admin_id.clone(),
+                sender_name: Some(format!("好友申请通知{ONEBOT_EVENT_NOTE_SUFFIX}")),
+                reply_target: format!("private:{admin_id}"),
+                content: format!(
+                    "{ONEBOT_EVENT_FRIEND_REQUEST_PREFIX}\n收到新的好友申请。\n- 申请人QQ: {applicant_id}\n- 验证信息: {}\n- flag: {flag}\n如需同意/拒绝，请调用 onebot_friend_request_approve（flag 必填）。",
+                    if comment.trim().is_empty() { "（无）" } else { comment.trim() }
+                ),
+                channel: "onebot_v11".to_string(),
+                timestamp: ts,
+            })
+            .collect()
+    }
+
+    fn parse_event(&self, event: OneBotEvent) -> Vec<ChannelMessage> {
+        match event.post_type.trim().to_ascii_lowercase().as_str() {
+            "message" => self.parse_message_event(event).into_iter().collect(),
+            "notice" => self.parse_notice_event(event),
+            "request" => self.parse_request_event(event),
+            _ => Vec::new(),
+        }
     }
 
     fn with_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -289,9 +492,10 @@ impl OneBotV11Channel {
                 }
             };
 
-            if let Some(message) = state.channel.parse_event(event) {
+            for message in state.channel.parse_event(event) {
                 if state.tx.send(message).await.is_err() {
                     tracing::warn!("OneBot v11: message channel closed");
+                    break;
                 }
             }
 
@@ -308,6 +512,9 @@ impl OneBotV11Channel {
                 allowed_groups: self.allowed_groups.clone(),
                 require_at_in_group: self.require_at_in_group,
                 client: self.client.clone(),
+                admin_users: self.admin_users.clone(),
+                friend_request_notify_mode: self.friend_request_notify_mode,
+                friend_request_notify_targets: self.friend_request_notify_targets.clone(),
                 dedup: self.dedup.clone(),
             }),
             tx,
@@ -463,6 +670,12 @@ struct OneBotEvent {
     #[serde(default)]
     post_type: String,
     #[serde(default)]
+    notice_type: String,
+    #[serde(default)]
+    sub_type: String,
+    #[serde(default)]
+    request_type: String,
+    #[serde(default)]
     message_type: String,
     #[serde(default)]
     message: serde_json::Value,
@@ -471,9 +684,17 @@ struct OneBotEvent {
     #[serde(default)]
     message_id: Option<serde_json::Value>,
     #[serde(default)]
+    flag: Option<String>,
+    #[serde(default)]
+    comment: Option<String>,
+    #[serde(default)]
     user_id: Option<i64>,
     #[serde(default)]
     group_id: Option<i64>,
+    #[serde(default)]
+    target_id: Option<i64>,
+    #[serde(default)]
+    operator_id: Option<i64>,
     #[serde(default)]
     self_id: Option<serde_json::Value>,
     #[serde(default)]
@@ -950,6 +1171,11 @@ mod tests {
             admin_only_tools: vec![],
             command_external_network_access: crate::config::OneBotCommandExternalNetworkAccess::Off,
             non_admin_context_file: "NON_ADMIN.md".to_string(),
+            message_merge_window_secs: 10,
+            interrupt_on_recall: true,
+            vision_input_enabled: false,
+            friend_request_notify_mode: crate::config::OneBotFriendRequestNotifyMode::AllAdmins,
+            friend_request_notify_targets: vec![],
         })
     }
 
@@ -1005,7 +1231,9 @@ mod tests {
         }))
         .unwrap();
 
-        let msg = ch.parse_event(event).expect("message should parse");
+        let messages = ch.parse_event(event);
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
         assert_eq!(msg.reply_target, "private:10001");
         assert_eq!(msg.content, "hello");
         assert_eq!(msg.channel, "onebot_v11");
@@ -1026,7 +1254,7 @@ mod tests {
             "raw_message": "大家好"
         }))
         .unwrap();
-        assert!(ch.parse_event(ignored).is_none());
+        assert!(ch.parse_event(ignored).is_empty());
 
         let accepted: OneBotEvent = serde_json::from_value(json!({
             "post_type": "message",
@@ -1040,7 +1268,9 @@ mod tests {
         }))
         .unwrap();
 
-        let msg = ch.parse_event(accepted).expect("mentioned group message");
+        let messages = ch.parse_event(accepted);
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
         assert_eq!(msg.reply_target, "group:20001");
         assert_eq!(msg.content, "你好");
     }
@@ -1059,6 +1289,11 @@ mod tests {
             admin_only_tools: vec![],
             command_external_network_access: crate::config::OneBotCommandExternalNetworkAccess::Off,
             non_admin_context_file: "NON_ADMIN.md".to_string(),
+            message_merge_window_secs: 10,
+            interrupt_on_recall: true,
+            vision_input_enabled: false,
+            friend_request_notify_mode: crate::config::OneBotFriendRequestNotifyMode::AllAdmins,
+            friend_request_notify_targets: vec![],
         });
 
         let event: OneBotEvent = serde_json::from_value(json!({
@@ -1070,7 +1305,69 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(ch.parse_event(event).is_none());
+        assert!(ch.parse_event(event).is_empty());
+    }
+
+    #[test]
+    fn parse_group_poke_event_to_synthetic_message() {
+        let ch = channel();
+        let event: OneBotEvent = serde_json::from_value(json!({
+            "post_type": "notice",
+            "notice_type": "notify",
+            "sub_type": "poke",
+            "user_id": 10001,
+            "group_id": 20001,
+            "target_id": 30001,
+            "self_id": 30001,
+            "time": 1700000001
+        }))
+        .unwrap();
+
+        let messages = ch.parse_event(event);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].reply_target, "group:20001");
+        assert!(messages[0].content.contains(ONEBOT_EVENT_POKE_PREFIX));
+    }
+
+    #[test]
+    fn parse_friend_request_event_notifies_specific_accounts() {
+        let ch = OneBotV11Channel::new(crate::config::schema::OneBotV11Config {
+            api_url: "http://127.0.0.1:3000".to_string(),
+            access_token: None,
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: 8096,
+            allowed_users: vec!["*".to_string()],
+            allowed_groups: vec![],
+            require_at_in_group: true,
+            admin_users: vec!["111".to_string(), "222".to_string()],
+            admin_only_tools: vec![],
+            command_external_network_access: crate::config::OneBotCommandExternalNetworkAccess::Off,
+            non_admin_context_file: "NON_ADMIN.md".to_string(),
+            message_merge_window_secs: 10,
+            interrupt_on_recall: true,
+            vision_input_enabled: false,
+            friend_request_notify_mode:
+                crate::config::OneBotFriendRequestNotifyMode::SpecificAccounts,
+            friend_request_notify_targets: vec!["333".to_string(), "444".to_string()],
+        });
+
+        let event: OneBotEvent = serde_json::from_value(json!({
+            "post_type": "request",
+            "request_type": "friend",
+            "user_id": 555,
+            "comment": "我是新朋友",
+            "flag": "flag-abc"
+        }))
+        .unwrap();
+
+        let messages = ch.parse_event(event);
+        assert_eq!(messages.len(), 2);
+        assert!(messages
+            .iter()
+            .all(|m| m.reply_target.starts_with("private:")));
+        assert!(messages[0]
+            .content
+            .contains(ONEBOT_EVENT_FRIEND_REQUEST_PREFIX));
     }
 
     #[test]

@@ -3550,6 +3550,12 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     admin_only_tools: vec![],
                     command_external_network_access: OneBotCommandExternalNetworkAccess::Off,
                     non_admin_context_file: "NON_ADMIN.md".to_string(),
+                    message_merge_window_secs: 10,
+                    interrupt_on_recall: true,
+                    vision_input_enabled: false,
+                    friend_request_notify_mode:
+                        crate::config::OneBotFriendRequestNotifyMode::AllAdmins,
+                    friend_request_notify_targets: vec![],
                 });
             }
             _ => break, // Done

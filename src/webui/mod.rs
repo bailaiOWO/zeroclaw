@@ -97,6 +97,7 @@ pub async fn handle_api_config(State(state): State<AppState>) -> impl IntoRespon
             "admin_users": o.admin_users.len(),
             "admin_only_tools": o.admin_only_tools.len(),
             "non_admin_context_file": &o.non_admin_context_file,
+            "vision_input_enabled": o.vision_input_enabled,
             "command_external_network_access": command_external_network_access,
         })
     });
@@ -1394,7 +1395,28 @@ pub struct ContextFilesResp {
     pub selected: String,
     pub content: String,
     pub files: Vec<ContextFileItemResp>,
+    pub flow_default_variant: String,
+    pub flow_variants: Vec<ContextFlowVariantResp>,
     pub notes: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ContextFlowVariantResp {
+    pub id: String,
+    pub label: String,
+    pub cards: Vec<ContextFlowCardResp>,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct ContextFlowCardResp {
+    pub id: String,
+    pub order: usize,
+    pub title: String,
+    pub subtitle: String,
+    pub source: String,
+    pub condition: String,
+    pub role: String,
+    pub content: String,
 }
 
 struct ContextFileCandidate {
@@ -1408,6 +1430,16 @@ struct ContextFileCandidate {
     modified_unix: Option<u64>,
     active_in_prompt: bool,
     is_virtual: bool,
+}
+
+#[derive(Default)]
+struct OneBotPreviewData {
+    session_id: Option<String>,
+    target: Option<String>,
+    history_lines: Vec<String>,
+    latest_user_text: Option<String>,
+    sender_id: Option<String>,
+    sender_name: Option<String>,
 }
 
 fn file_metadata(path: &std::path::Path) -> (bool, Option<u64>, Option<u64>) {
@@ -1445,6 +1477,507 @@ fn push_file_candidate(
         active_in_prompt,
         is_virtual: false,
     });
+}
+
+fn sanitize_context_card_id(raw: &str) -> String {
+    let mapped: String = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    mapped.trim_matches('_').to_string()
+}
+
+fn candidate_preview_content(candidate: &ContextFileCandidate) -> String {
+    if candidate.is_virtual {
+        return candidate.inline_content.clone().unwrap_or_default();
+    }
+
+    let Some(path) = candidate.abs_path.as_ref() else {
+        return String::new();
+    };
+
+    if !candidate.exists {
+        return format!("[File not found: {}]", candidate.path);
+    }
+
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+fn build_system_file_cards(candidates: &[ContextFileCandidate]) -> Vec<ContextFlowCardResp> {
+    candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.active_in_prompt && candidate.path.to_ascii_lowercase().ends_with(".md")
+        })
+        .map(|candidate| ContextFlowCardResp {
+            id: format!("system_file_{}", sanitize_context_card_id(&candidate.path)),
+            order: 0,
+            title: format!("系统上下文文件：{}", candidate.path),
+            subtitle: candidate.label.clone(),
+            source: format!("workspace/{}", candidate.path),
+            condition: "每次 OneBot 消息都会注入（按文件存在情况）".to_string(),
+            role: "system".to_string(),
+            content: candidate_preview_content(candidate),
+        })
+        .collect()
+}
+
+fn context_preview_tool_descs(config: &crate::config::Config) -> Vec<(&'static str, &'static str)> {
+    let mut tool_descs = vec![
+        ("shell", "Execute terminal commands."),
+        ("file_read", "Read file contents."),
+        ("file_write", "Write file contents."),
+        ("memory_store", "Save to memory."),
+        ("memory_recall", "Search memory."),
+        ("memory_forget", "Delete a memory entry."),
+        ("schedule", "Manage scheduled tasks."),
+        ("pushover", "Send a Pushover notification."),
+        ("screenshot", "Capture a screenshot."),
+        ("image_info", "Read image metadata."),
+    ];
+
+    if config.browser.enabled {
+        tool_descs.push(("browser_open", "Open approved HTTPS URLs in Brave Browser."));
+    }
+    if config.http_request.enabled {
+        tool_descs.push((
+            "http_request",
+            "Make HTTP requests to allowed external domains.",
+        ));
+    }
+    if config.composio.enabled {
+        tool_descs.push(("composio", "Execute actions on connected SaaS apps."));
+    }
+    if config.channels_config.onebot_v11.is_some() {
+        tool_descs.push((
+            "onebot_contact_search",
+            "Search QQ contacts/groups by QQ号、昵称、群名、备注.",
+        ));
+        tool_descs.push((
+            "onebot_send_to",
+            "Send QQ message/files to private/group target via OneBot v11.",
+        ));
+        tool_descs.push((
+            "onebot_friend_request_approve",
+            "Approve/reject QQ friend requests via OneBot v11.",
+        ));
+    }
+    if !config.agents.is_empty() {
+        tool_descs.push(("delegate", "Delegate to specialized sub-agent."));
+    }
+    if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
+        tool_descs.push(("gpio_read", "Read GPIO pin value."));
+        tool_descs.push(("gpio_write", "Set GPIO pin value."));
+        tool_descs.push(("arduino_upload", "Upload Arduino sketch."));
+        tool_descs.push(("hardware_memory_map", "Read hardware memory map."));
+        tool_descs.push(("hardware_board_info", "Read hardware board info."));
+        tool_descs.push((
+            "hardware_memory_read",
+            "Read hardware memory/register values.",
+        ));
+        tool_descs.push(("hardware_capabilities", "Read hardware capabilities."));
+    }
+
+    tool_descs
+}
+
+async fn load_latest_onebot_preview(state: &AppState, max_messages: usize) -> OneBotPreviewData {
+    let mut preview = OneBotPreviewData::default();
+
+    let entries = match state
+        .mem
+        .list(Some(&crate::memory::MemoryCategory::Conversation), None)
+        .await
+    {
+        Ok(v) => v,
+        Err(_) => return preview,
+    };
+
+    let Some(session_id) = entries
+        .into_iter()
+        .filter_map(|entry| entry.session_id)
+        .find(|session| session.starts_with("onebot_v11:"))
+    else {
+        return preview;
+    };
+
+    preview.session_id = Some(session_id.clone());
+    preview.target = session_id
+        .split_once(':')
+        .map(|(_, target)| target.to_string());
+
+    let mut session_entries = match state
+        .mem
+        .list(
+            Some(&crate::memory::MemoryCategory::Conversation),
+            Some(session_id.as_str()),
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(_) => return preview,
+    };
+
+    session_entries.truncate(max_messages.max(1));
+    session_entries.reverse();
+
+    for entry in session_entries {
+        let fallback_role = if entry.key.ends_with("_assistant") {
+            "assistant"
+        } else {
+            "user"
+        };
+
+        let mut role = fallback_role.to_string();
+        let mut text = entry.content.clone();
+        let mut sender_id: Option<String> = None;
+        let mut sender_name: Option<String> = None;
+
+        if let Ok(parsed) = serde_json::from_str::<StoredConversationTurn>(&entry.content) {
+            if !parsed.role.trim().is_empty() {
+                role = parsed.role;
+            }
+            if !parsed.text.trim().is_empty() {
+                text = parsed.text;
+            }
+            sender_id = parsed.sender_id;
+            sender_name = parsed.sender_name;
+        }
+
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+
+        let role_display = if role.eq_ignore_ascii_case("assistant") {
+            "assistant"
+        } else {
+            "user"
+        };
+        preview
+            .history_lines
+            .push(format!("[{role_display}] {text}"));
+
+        if role_display == "user" {
+            preview.latest_user_text = Some(text.to_string());
+            if preview.sender_id.is_none() {
+                preview.sender_id = sender_id;
+            }
+            if preview.sender_name.is_none() {
+                preview.sender_name = sender_name;
+            }
+        }
+    }
+
+    if preview.sender_id.is_none() {
+        if let Some(target) = preview
+            .target
+            .as_deref()
+            .and_then(|value| value.strip_prefix("private:"))
+        {
+            preview.sender_id = Some(target.to_string());
+        }
+    }
+
+    preview
+}
+
+fn render_sender_context_preview(
+    onebot: Option<&crate::config::OneBotV11Config>,
+    preview: &OneBotPreviewData,
+    sender_is_admin: bool,
+    model_vision_enabled: bool,
+) -> String {
+    let target = preview
+        .target
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("private:示例QQ号");
+    let sender_id = preview
+        .sender_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("示例QQ号");
+    let sender_name = preview
+        .sender_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("示例昵称");
+
+    let (
+        policy_mode,
+        external_allowed,
+        blocked_tools,
+        merge_window,
+        interrupt_on_recall,
+        friend_notify_mode,
+        vision_input_requested,
+    ) = if let Some(cfg) = onebot {
+        let policy_mode = match cfg.command_external_network_access {
+            crate::config::OneBotCommandExternalNetworkAccess::Off => "off",
+            crate::config::OneBotCommandExternalNetworkAccess::On => "on",
+            crate::config::OneBotCommandExternalNetworkAccess::AdminOnly => "admin_only",
+        };
+        let friend_notify_mode = match cfg.friend_request_notify_mode {
+            crate::config::OneBotFriendRequestNotifyMode::AllAdmins => "all_admins",
+            crate::config::OneBotFriendRequestNotifyMode::SpecificAccounts => "specific_accounts",
+        };
+        let external_allowed = match cfg.command_external_network_access {
+            crate::config::OneBotCommandExternalNetworkAccess::Off => false,
+            crate::config::OneBotCommandExternalNetworkAccess::On => true,
+            crate::config::OneBotCommandExternalNetworkAccess::AdminOnly => sender_is_admin,
+        };
+        let blocked_tools = if sender_is_admin {
+            "无".to_string()
+        } else if cfg.admin_only_tools.is_empty() {
+            "无".to_string()
+        } else {
+            cfg.admin_only_tools.join(", ")
+        };
+        (
+            policy_mode,
+            external_allowed,
+            blocked_tools,
+            cfg.message_merge_window_secs,
+            cfg.interrupt_on_recall,
+            friend_notify_mode,
+            cfg.vision_input_enabled,
+        )
+    } else {
+        (
+            "off",
+            false,
+            "无（未启用 OneBot 管理员策略）".to_string(),
+            0,
+            false,
+            "all_admins",
+            false,
+        )
+    };
+    let vision_input_effective = vision_input_requested && model_vision_enabled;
+
+    format!(
+        "[Sender context]\n- Channel: onebot_v11\n- Reply target: {target}\n- Chat type: {}\n- Sender: {sender_id} ({sender_name})\n- Sender is admin: {}\n- command_external_network_access: {policy_mode}\n- external command network access for this sender: {}\n- Admin-only blocked tools: {blocked_tools}\n- message_merge_window_secs: {merge_window}\n- interrupt_on_recall: {}\n- vision_model_enabled: {}\n- vision_input_requested: {}\n- vision_input_effective: {}\n- friend_request_notify_mode: {friend_notify_mode}",
+        if target.starts_with("group:") { "group" } else { "private" },
+        if sender_is_admin { "yes" } else { "no" },
+        if external_allowed { "enabled" } else { "disabled" },
+        if interrupt_on_recall { "true" } else { "false" },
+        if model_vision_enabled {
+            "true"
+        } else {
+            "false"
+        },
+        if vision_input_requested { "true" } else { "false" },
+        if vision_input_effective {
+            "true"
+        } else {
+            "false"
+        },
+    )
+}
+
+fn load_non_admin_context_preview(
+    config: &crate::config::Config,
+    workspace: &std::path::Path,
+) -> (String, String) {
+    let relative = config
+        .channels_config
+        .onebot_v11
+        .as_ref()
+        .map(|cfg| cfg.non_admin_context_file.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("NON_ADMIN.md");
+
+    let abs = if std::path::Path::new(relative).is_absolute() {
+        std::path::PathBuf::from(relative)
+    } else {
+        workspace.join(relative)
+    };
+
+    let content = std::fs::read_to_string(&abs)
+        .ok()
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| "（文件为空或不存在）".to_string());
+
+    (relative.to_string(), content)
+}
+
+fn build_context_flow_variants(
+    config: &crate::config::Config,
+    workspace: &std::path::Path,
+    preview: &OneBotPreviewData,
+    candidates: &[ContextFileCandidate],
+) -> (String, Vec<ContextFlowVariantResp>) {
+    let model = config
+        .default_model
+        .as_deref()
+        .unwrap_or("anthropic/claude-sonnet-4");
+    let model_vision_enabled = config
+        .channels_config
+        .onebot_v11
+        .as_ref()
+        .is_some_and(|_| crate::channels::onebot_model_vision_enabled(config, model));
+    let onebot_vision_input_requested = config
+        .channels_config
+        .onebot_v11
+        .as_ref()
+        .is_some_and(|cfg| cfg.vision_input_enabled);
+    let onebot_vision_input_effective = onebot_vision_input_requested && model_vision_enabled;
+
+    let history_content = if preview.history_lines.is_empty() {
+        "（暂无 OneBot 会话历史。运行一次 OneBot 对话后，这里会显示最近聊天记录。）".to_string()
+    } else {
+        preview.history_lines.join("\n")
+    };
+
+    let (non_admin_path, non_admin_content) = load_non_admin_context_preview(config, workspace);
+    let latest_user = preview
+        .latest_user_text
+        .as_deref()
+        .unwrap_or("（这里会显示最近一条用户消息示例）");
+
+    let system_file_cards = build_system_file_cards(candidates);
+
+    let make_common_cards = |sender_is_admin: bool| {
+        let mut cards = vec![ContextFlowCardResp {
+            id: "system_runtime".to_string(),
+            order: 1,
+            title: "系统提示词框架（运行时）".to_string(),
+            subtitle: "工具协议、安全策略、技能、运行时与渠道能力说明（文件正文拆分见下方独立卡片）"
+                .to_string(),
+            source: "channels::build_system_prompt + compose_system_prompt_for_channel(onebot_v11)"
+                .to_string(),
+            condition: "每次 OneBot 消息都会注入".to_string(),
+            role: "system".to_string(),
+            content: format!(
+                "- 默认模型: {model}\n- compact_context: {}\n- identity.format: {}\n- 渠道: onebot_v11\n- vision_input_requested: {}\n- vision_input_effective: {}\n- 下方卡片将 OpenClaw Markdown 上下文逐文件拆分展示（每个文件单独一张卡片）",
+                config.agent.compact_context,
+                config.identity.format,
+                onebot_vision_input_requested,
+                onebot_vision_input_effective,
+            ),
+        }];
+
+        for (idx, mut file_card) in system_file_cards.iter().cloned().enumerate() {
+            file_card.order = idx + 2;
+            cards.push(file_card);
+        }
+
+        let mut next_order = cards.len() + 1;
+        cards.push(ContextFlowCardResp {
+            id: "conversation_history".to_string(),
+            order: next_order,
+            title: "聊天记录（Conversation History）".to_string(),
+            subtitle: "来自 memory.conversation 的同会话历史消息".to_string(),
+            source: "memory.list(category=Conversation, session_id=onebot_v11:...)".to_string(),
+            condition: "auto_save_memory 开启且会话存在历史".to_string(),
+            role: "history".to_string(),
+            content: history_content.clone(),
+        });
+        next_order += 1;
+        cards.push(ContextFlowCardResp {
+            id: "sender_context".to_string(),
+            order: next_order,
+            title: "发送者上下文（Sender Context）".to_string(),
+            subtitle: "包含聊天对象、管理员身份、工具限制、命令外网权限".to_string(),
+            source: "channels::channel_sender_context".to_string(),
+            condition: "OneBot 且配置了 admin_users 时注入".to_string(),
+            role: "system".to_string(),
+            content: render_sender_context_preview(
+                config.channels_config.onebot_v11.as_ref(),
+                preview,
+                sender_is_admin,
+                model_vision_enabled,
+            ),
+        });
+
+        cards
+    };
+
+    let mut admin_cards = make_common_cards(true);
+    let mut next_admin_order = admin_cards.len() + 1;
+    admin_cards.push(ContextFlowCardResp {
+        id: "memory_recall".to_string(),
+        order: next_admin_order,
+        title: "记忆召回前缀（Memory Recall）".to_string(),
+        subtitle: "按当前用户消息动态检索非 conversation 记忆并拼接到 user 消息前".to_string(),
+        source: "channels::build_memory_context (memory.recall)".to_string(),
+        condition: "召回命中时注入 [Memory context] 段".to_string(),
+        role: "user-prefix".to_string(),
+        content:
+            "[Memory context]\n- key: value\n- ...\n\n（该段按实时消息动态变化，这里展示结构示意）"
+                .to_string(),
+    });
+    next_admin_order += 1;
+    admin_cards.push(ContextFlowCardResp {
+        id: "user_message".to_string(),
+        order: next_admin_order,
+        title: "当前用户消息（User）".to_string(),
+        subtitle: "最终送入模型的用户输入（可能带上 Memory context 前缀）".to_string(),
+        source: "OneBot 实时入站消息".to_string(),
+        condition: "每次消息必定注入".to_string(),
+        role: "user".to_string(),
+        content: latest_user.to_string(),
+    });
+
+    let mut non_admin_cards = make_common_cards(false);
+    let mut next_non_admin_order = non_admin_cards.len() + 1;
+    non_admin_cards.push(ContextFlowCardResp {
+        id: "non_admin_context".to_string(),
+        order: next_non_admin_order,
+        title: "非管理员上下文（NON_ADMIN）".to_string(),
+        subtitle: "仅 OneBot 非管理员消息会额外注入".to_string(),
+        source: format!("workspace/{non_admin_path}"),
+        condition: "sender_is_admin=false".to_string(),
+        role: "system".to_string(),
+        content: non_admin_content,
+    });
+    next_non_admin_order += 1;
+    non_admin_cards.push(ContextFlowCardResp {
+        id: "memory_recall".to_string(),
+        order: next_non_admin_order,
+        title: "记忆召回前缀（Memory Recall）".to_string(),
+        subtitle: "按当前用户消息动态检索非 conversation 记忆并拼接到 user 消息前".to_string(),
+        source: "channels::build_memory_context (memory.recall)".to_string(),
+        condition: "召回命中时注入 [Memory context] 段".to_string(),
+        role: "user-prefix".to_string(),
+        content:
+            "[Memory context]\n- key: value\n- ...\n\n（该段按实时消息动态变化，这里展示结构示意）"
+                .to_string(),
+    });
+    next_non_admin_order += 1;
+    non_admin_cards.push(ContextFlowCardResp {
+        id: "user_message".to_string(),
+        order: next_non_admin_order,
+        title: "当前用户消息（User）".to_string(),
+        subtitle: "最终送入模型的用户输入（可能带上 Memory context 前缀）".to_string(),
+        source: "OneBot 实时入站消息".to_string(),
+        condition: "每次消息必定注入".to_string(),
+        role: "user".to_string(),
+        content: latest_user.to_string(),
+    });
+
+    (
+        "non_admin".to_string(),
+        vec![
+            ContextFlowVariantResp {
+                id: "admin".to_string(),
+                label: "管理员".to_string(),
+                cards: admin_cards,
+            },
+            ContextFlowVariantResp {
+                id: "non_admin".to_string(),
+                label: "非管理员".to_string(),
+                cards: non_admin_cards,
+            },
+        ],
+    )
 }
 
 /// GET /api/context-files — preview prompt-injected identity/context files.
@@ -1574,12 +2107,16 @@ pub async fn handle_api_context_files_get(
         })
         .unwrap_or_default();
 
+    let onebot_preview = load_latest_onebot_preview(&state, 16).await;
+    let (flow_default_variant, flow_variants) =
+        build_context_flow_variants(&config, &workspace, &onebot_preview, &candidates);
+
     let files = candidates
-        .into_iter()
+        .iter()
         .map(|candidate| ContextFileItemResp {
-            id: candidate.id,
-            label: candidate.label,
-            path: candidate.path,
+            id: candidate.id.clone(),
+            label: candidate.label.clone(),
+            path: candidate.path.clone(),
             exists: candidate.exists,
             size_bytes: candidate.size_bytes,
             modified_unix: candidate.modified_unix,
@@ -1593,14 +2130,20 @@ pub async fn handle_api_context_files_get(
         selected,
         content,
         files,
+        flow_default_variant,
+        flow_variants,
         notes: vec![
-            "这里展示的是磁盘上的实时文件内容；点击刷新可立即看到外部修改。".to_string(),
-            "WebUI Chat / agent::process_message 会在每次请求前重新读取这些文件。".to_string(),
-            "Channels 通道在启动时构建系统提示词，修改 SOUL/IDENTITY 后通常需要重启 daemon/channels 才会全面生效。".to_string(),
-            "NON_ADMIN.md 为条件注入：仅在 OneBot v11 且发送者不是管理员时加入上下文。"
+            "此页面展示的是 OneBot 进入 LLM 前的上下文拼装流程（按发送顺序）与来源。".to_string(),
+            "点击每张卡片可展开完整内容；箭头表示注入到模型的先后顺序。".to_string(),
+            "OpenClaw 的 Markdown 上下文文件（AGENTS/SOUL/TOOLS/IDENTITY/USER/HEARTBEAT/BOOTSTRAP/MEMORY）已拆分为独立卡片，不再聚合成单一 System 卡片。"
                 .to_string(),
-            "管理员工具白名单策略以 channels_config.onebot_v11.admin_users/admin_only_tools 为准。".to_string(),
-            "命令外网访问策略由 channels_config.onebot_v11.command_external_network_access 控制（off/on/admin_only）。"
+            "管理员/非管理员切换用于对比 sender context、NON_ADMIN.md、工具权限与外网命令策略差异。"
+                .to_string(),
+            "聊天记录卡片来自 memory.conversation 的最近会话；记忆召回卡片展示结构示意，真实内容会随实时消息变化。"
+                .to_string(),
+            "文件候选列表仍保留在接口返回中，便于调试（包括 AGENTS/SOUL/IDENTITY/NON_ADMIN 等磁盘内容）。"
+                .to_string(),
+            "管理员工具白名单策略以 channels_config.onebot_v11.admin_users/admin_only_tools 为准；命令外网访问策略以 command_external_network_access（off/on/admin_only）为准。"
                 .to_string(),
         ],
     })

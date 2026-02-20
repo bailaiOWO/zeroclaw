@@ -380,37 +380,38 @@
         <div class="card-header">
           <div class="icon-circle"><span class="material-symbols-outlined">description</span></div>
           <div class="header-main">
-            <span class="card-title">自动更新上下文文件</span>
-            <div class="card-subtitle">查看 SOUL / IDENTITY / AIEOS 等会影响系统提示词注入的当前内容</div>
+            <span class="card-title">发送给 AI 的上下文流程</span>
+            <div class="card-subtitle">按注入顺序展示系统提示词、聊天记录、发送者信息、NON_ADMIN 以及当前用户消息</div>
           </div>
           <label class="inline-toggle-label">
             <input type="checkbox" id="context-auto-refresh" onchange="toggleContextAutoRefresh(this.checked)">
             自动刷新 (5s)
           </label>
           <div class="header-actions">
-            <button class="btn btn-text" onclick="refreshContextFiles()">刷新内容</button>
+            <button class="btn btn-text" onclick="refreshContextFiles()">刷新流程</button>
           </div>
         </div>
 
-        <div class="context-files-layout">
-          <aside class="context-files-sidebar" id="context-files-list">
-            <div class="empty-state compact"><p>加载中…</p></div>
-          </aside>
-
-          <section class="context-files-content">
-            <div class="context-files-toolbar">
-              <div class="header-main">
-                <div class="context-title" id="context-selected-name">未选择文件</div>
-                <div class="context-meta" id="context-selected-meta">—</div>
-              </div>
-              <div class="context-toolbar-actions">
-                <span class="chip" id="context-mode-chip">模式: <span id="context-mode">—</span></span>
-                <button class="btn btn-text" onclick="copyCurrentContextFile()">复制内容</button>
-              </div>
+        <div class="context-files-content">
+          <div class="context-files-toolbar">
+            <div class="header-main">
+              <div class="context-title">上下文链路总览</div>
+              <div class="context-meta" id="context-selected-meta">—</div>
             </div>
-            <pre class="context-file-content" id="context-file-content"></pre>
-            <div class="context-notes" id="context-notes"></div>
-          </section>
+            <div class="context-toolbar-actions">
+              <div class="segmented" id="context-variant-tabs">
+                <button class="seg active" id="context-variant-admin" onclick="setContextVariant('admin')">管理员</button>
+                <button class="seg" id="context-variant-non_admin" onclick="setContextVariant('non_admin')">非管理员</button>
+              </div>
+              <span class="chip" id="context-mode-chip">模式: <span id="context-mode">—</span></span>
+              <button class="btn btn-text" onclick="copyCurrentContextFile()">复制当前视图</button>
+            </div>
+          </div>
+
+          <div class="context-flow" id="context-flow">
+            <div class="empty-state compact"><p>加载中…</p></div>
+          </div>
+          <div class="context-notes" id="context-notes"></div>
         </div>
       </div>
     </div>

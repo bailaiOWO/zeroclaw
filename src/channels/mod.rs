@@ -69,6 +69,7 @@ const CHANNEL_PARALLELISM_PER_CHANNEL: usize = 4;
 const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const DEFAULT_NON_ADMIN_CONTEXT_FILE: &str = "NON_ADMIN.md";
+const ONEBOT_SYNTHETIC_EVENT_PREFIX: &str = "[[onebot_event:";
 
 #[derive(Clone)]
 struct ChannelRuntimeContext {
@@ -89,6 +90,11 @@ struct ChannelRuntimeContext {
     onebot_admin_only_tools: Arc<HashSet<String>>,
     onebot_non_admin_context_file: Arc<String>,
     onebot_command_external_network_access: OneBotCommandExternalNetworkAccess,
+    onebot_message_merge_window_secs: u64,
+    onebot_interrupt_on_recall: bool,
+    onebot_vision_input_requested: bool,
+    onebot_vision_input_enabled: bool,
+    onebot_model_vision_enabled: bool,
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
@@ -224,7 +230,7 @@ async fn load_conversation_history(
     out
 }
 
-fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
+pub(crate) fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     match channel_name {
         "telegram" => Some(
             "When responding on Telegram, include media markers for files or URLs that should be sent as attachments. Use one marker per attachment with this exact syntax: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]. Keep normal user-facing text outside markers and never wrap markers in code fences.",
@@ -236,7 +242,10 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     }
 }
 
-fn compose_system_prompt_for_channel<'a>(base_prompt: &'a str, channel_name: &str) -> Cow<'a, str> {
+pub(crate) fn compose_system_prompt_for_channel<'a>(
+    base_prompt: &'a str,
+    channel_name: &str,
+) -> Cow<'a, str> {
     match channel_delivery_instructions(channel_name) {
         Some(instructions) => {
             let mut merged = String::with_capacity(base_prompt.len() + instructions.len() + 64);
@@ -247,6 +256,106 @@ fn compose_system_prompt_for_channel<'a>(base_prompt: &'a str, channel_name: &st
         }
         None => Cow::Borrowed(base_prompt),
     }
+}
+
+fn onebot_route_vision_flag(config: &Config, model_name: &str) -> Option<bool> {
+    let trimmed = model_name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(hint) = trimmed.strip_prefix("hint:") {
+        let normalized_hint = hint.trim().to_ascii_lowercase();
+        return config
+            .model_routes
+            .iter()
+            .find(|route| route.hint.trim().eq_ignore_ascii_case(&normalized_hint))
+            .map(|route| route.vision);
+    }
+
+    config
+        .model_routes
+        .iter()
+        .find(|route| route.model.trim().eq_ignore_ascii_case(trimmed))
+        .map(|route| route.vision)
+}
+
+fn looks_like_vision_model_name(model_name: &str) -> bool {
+    let normalized = model_name.trim().to_ascii_lowercase();
+    [
+        "vision",
+        "-vl",
+        "gpt-4o",
+        "gpt-4.1",
+        "gemini",
+        "claude-3",
+        "claude-sonnet-4",
+        "qwen-vl",
+        "glm-4v",
+        "minicpm",
+        "llava",
+    ]
+    .iter()
+    .any(|token| normalized.contains(token))
+}
+
+pub(crate) fn onebot_model_vision_enabled(config: &Config, model_name: &str) -> bool {
+    onebot_route_vision_flag(config, model_name)
+        .unwrap_or_else(|| looks_like_vision_model_name(model_name))
+}
+
+fn extract_onebot_image_markers(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    while cursor < content.len() {
+        let Some(open_rel) = content[cursor..].find("[IMAGE:") else {
+            break;
+        };
+        let open = cursor + open_rel;
+        let Some(close_rel) = content[open..].find(']') else {
+            break;
+        };
+        let close = open + close_rel;
+        let raw = &content[open + "[IMAGE:".len()..close];
+        let target = raw.trim();
+        if !target.is_empty() {
+            out.push(target.to_string());
+        }
+        cursor = close + 1;
+    }
+    out
+}
+
+fn preprocess_onebot_user_content(
+    raw: &str,
+    vision_input_requested: bool,
+    model_vision_enabled: bool,
+) -> String {
+    let images = extract_onebot_image_markers(raw);
+    if images.is_empty() {
+        return raw.to_string();
+    }
+
+    let mut lines = Vec::new();
+    lines.push(raw.trim().to_string());
+
+    if !vision_input_requested {
+        lines.push(
+            "【视觉输入关闭】检测到图片，但当前渠道配置未启用视觉输入；请按文本上下文继续回复。"
+                .to_string(),
+        );
+    } else if model_vision_enabled {
+        lines.push("【视觉输入】检测到用户发送图片，请直接结合图片内容回复。".to_string());
+    } else {
+        lines.push(
+            "【视觉输入未生效】已开启视觉输入，但当前模型未标记为视觉模型；你只能基于图片标记中的地址信息回答。"
+                .to_string(),
+        );
+    }
+    for (idx, target) in images.iter().enumerate() {
+        lines.push(format!("- 图片{}: {}", idx + 1, target));
+    }
+    lines.join("\n")
 }
 
 async fn build_memory_context(mem: &dyn Memory, user_msg: &str) -> String {
@@ -376,6 +485,8 @@ fn channel_sender_context(
     external_network_command_mode: OneBotCommandExternalNetworkAccess,
     external_network_command_allowed: bool,
     blocked_tools: &HashSet<String>,
+    vision_input_requested: bool,
+    vision_input_enabled: bool,
 ) -> Option<String> {
     if msg.channel != "onebot_v11" {
         return None;
@@ -429,6 +540,16 @@ fn channel_sender_context(
         }
     };
     lines.push(format!("命令外网访问：{shell_network_status}"));
+
+    let vision_status = if vision_input_enabled {
+        "已启用（渠道开关=ON，且当前模型支持视觉）"
+    } else if vision_input_requested {
+        "未生效（渠道开关=ON，但当前模型非视觉）"
+    } else {
+        "已关闭（渠道开关=OFF）"
+    };
+
+    lines.push(format!("视觉输入：{vision_status}"));
 
     Some(format!("【对话信息】\n{}\n【/对话信息】", lines.join("\n")))
 }
@@ -531,10 +652,20 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             .await;
     }
 
-    let enriched_message = if memory_context.is_empty() {
-        msg.content.clone()
+    let user_content = if msg.channel == "onebot_v11" {
+        preprocess_onebot_user_content(
+            &msg.content,
+            ctx.onebot_vision_input_requested,
+            ctx.onebot_model_vision_enabled,
+        )
     } else {
-        format!("{memory_context}{}", msg.content)
+        msg.content.clone()
+    };
+
+    let enriched_message = if memory_context.is_empty() {
+        user_content
+    } else {
+        format!("{memory_context}{user_content}")
     };
 
     let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
@@ -579,6 +710,8 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         ctx.onebot_command_external_network_access,
         external_network_command_allowed,
         &blocked_tools,
+        ctx.onebot_vision_input_requested,
+        ctx.onebot_vision_input_enabled,
     ) {
         history.push(ChatMessage::system(sender_ctx));
     }
@@ -691,6 +824,79 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     }
 }
 
+struct PendingMergedMessage {
+    msg: traits::ChannelMessage,
+    deadline: Instant,
+    merged_count: usize,
+}
+
+fn onebot_is_recall_control(msg: &traits::ChannelMessage) -> bool {
+    msg.channel == "onebot_v11"
+        && msg
+            .content
+            .starts_with(crate::channels::onebot_v11::ONEBOT_CONTROL_RECALL_PREFIX)
+}
+
+fn onebot_should_merge_message(ctx: &ChannelRuntimeContext, msg: &traits::ChannelMessage) -> bool {
+    msg.channel == "onebot_v11"
+        && ctx.onebot_message_merge_window_secs > 0
+        && !msg.content.starts_with(ONEBOT_SYNTHETIC_EVENT_PREFIX)
+        && !onebot_is_recall_control(msg)
+}
+
+fn merge_onebot_message_content(existing: &str, incoming: &str) -> String {
+    let existing = existing.trim();
+    let incoming = incoming.trim();
+    match (existing.is_empty(), incoming.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => incoming.to_string(),
+        (false, true) => existing.to_string(),
+        (false, false) => format!("{existing}\n{incoming}"),
+    }
+}
+
+fn prune_finished_abort_handles(
+    active_by_session: &mut HashMap<String, Vec<tokio::task::AbortHandle>>,
+) {
+    active_by_session.retain(|_, handles| {
+        handles.retain(|handle| !handle.is_finished());
+        !handles.is_empty()
+    });
+}
+
+fn next_pending_merge_wait_duration(
+    pending: &HashMap<String, PendingMergedMessage>,
+) -> Option<Duration> {
+    let now = Instant::now();
+    pending
+        .values()
+        .map(|entry| entry.deadline.saturating_duration_since(now))
+        .min()
+}
+
+fn spawn_channel_worker(
+    workers: &mut tokio::task::JoinSet<()>,
+    semaphore: &Arc<tokio::sync::Semaphore>,
+    ctx: &Arc<ChannelRuntimeContext>,
+    msg: traits::ChannelMessage,
+    session_id: String,
+    active_by_session: &mut HashMap<String, Vec<tokio::task::AbortHandle>>,
+) {
+    let sem = Arc::clone(semaphore);
+    let worker_ctx = Arc::clone(ctx);
+    let abort_handle = workers.spawn(async move {
+        let Ok(permit) = sem.acquire_owned().await else {
+            return;
+        };
+        let _permit = permit;
+        process_channel_message(worker_ctx, msg).await;
+    });
+    active_by_session
+        .entry(session_id)
+        .or_default()
+        .push(abort_handle);
+}
+
 async fn run_message_dispatch_loop(
     mut rx: tokio::sync::mpsc::Receiver<traits::ChannelMessage>,
     ctx: Arc<ChannelRuntimeContext>,
@@ -698,21 +904,115 @@ async fn run_message_dispatch_loop(
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
     let mut workers = tokio::task::JoinSet::new();
+    let mut pending_merge: HashMap<String, PendingMergedMessage> = HashMap::new();
+    let mut active_by_session: HashMap<String, Vec<tokio::task::AbortHandle>> = HashMap::new();
 
-    while let Some(msg) = rx.recv().await {
-        let permit = match Arc::clone(&semaphore).acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => break,
-        };
-
-        let worker_ctx = Arc::clone(&ctx);
-        workers.spawn(async move {
-            let _permit = permit;
-            process_channel_message(worker_ctx, msg).await;
-        });
-
+    loop {
         while let Some(result) = workers.try_join_next() {
             log_worker_join_result(result);
+        }
+        prune_finished_abort_handles(&mut active_by_session);
+
+        let next_wait = next_pending_merge_wait_duration(&pending_merge);
+        let wait = next_wait.unwrap_or_else(|| Duration::from_millis(50));
+
+        tokio::select! {
+            maybe_msg = rx.recv() => {
+                let Some(msg) = maybe_msg else {
+                    for (session_id, mut pending) in pending_merge.drain() {
+                        if pending.merged_count > 1 {
+                            pending.msg.content = format!(
+                                "【系统已合并连续消息，共 {} 条】\n{}",
+                                pending.merged_count,
+                                pending.msg.content
+                            );
+                        }
+                        spawn_channel_worker(
+                            &mut workers,
+                            &semaphore,
+                            &ctx,
+                            pending.msg,
+                            session_id,
+                            &mut active_by_session,
+                        );
+                    }
+                    break;
+                };
+
+                let session_id = conversation_session_id(&msg, ctx.isolate_channel_conversations);
+
+                if onebot_is_recall_control(&msg) {
+                    pending_merge.remove(&session_id);
+                    if ctx.onebot_interrupt_on_recall {
+                        if let Some(handles) = active_by_session.remove(&session_id) {
+                            for handle in handles {
+                                handle.abort();
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if onebot_should_merge_message(ctx.as_ref(), &msg) {
+                    let window = Duration::from_secs(ctx.onebot_message_merge_window_secs);
+                    if let Some(pending) = pending_merge.get_mut(&session_id) {
+                        pending.msg.content = merge_onebot_message_content(&pending.msg.content, &msg.content);
+                        pending.msg.id = msg.id;
+                        pending.msg.timestamp = msg.timestamp;
+                        if pending.msg.sender_name.is_none() {
+                            pending.msg.sender_name = msg.sender_name;
+                        }
+                        pending.deadline = Instant::now() + window;
+                        pending.merged_count += 1;
+                    } else {
+                        pending_merge.insert(
+                            session_id,
+                            PendingMergedMessage {
+                                msg,
+                                deadline: Instant::now() + window,
+                                merged_count: 1,
+                            },
+                        );
+                    }
+                    continue;
+                }
+
+                spawn_channel_worker(
+                    &mut workers,
+                    &semaphore,
+                    &ctx,
+                    msg,
+                    session_id,
+                    &mut active_by_session,
+                );
+            }
+            _ = tokio::time::sleep(wait), if next_wait.is_some() => {
+                let now = Instant::now();
+                let due_sessions = pending_merge
+                    .iter()
+                    .filter_map(|(session_id, pending)| (pending.deadline <= now).then_some(session_id.clone()))
+                    .collect::<Vec<_>>();
+
+                for session_id in due_sessions {
+                    if let Some(mut pending) = pending_merge.remove(&session_id) {
+                        if pending.merged_count > 1 {
+                            pending.msg.content = format!(
+                                "【系统已合并连续消息，共 {} 条】\n{}",
+                                pending.merged_count,
+                                pending.msg.content
+                            );
+                        }
+                        spawn_channel_worker(
+                            &mut workers,
+                            &semaphore,
+                            &ctx,
+                            pending.msg,
+                            session_id,
+                            &mut active_by_session,
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1490,6 +1790,21 @@ pub async fn start_channels(config: Config) -> Result<()> {
         "pushover",
         "Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.",
     ));
+    if config.channels_config.onebot_v11.is_some() {
+        tool_descs.push((
+            "onebot_contact_search",
+            "Search QQ contacts/groups via OneBot v11 by QQ号、昵称、群名、备注，并返回可直接发送的 reply_target。",
+        ));
+        tool_descs.push((
+            "onebot_send_to",
+            "Send QQ message/files to a specific target via OneBot v11. target 支持 private:QQ号 / group:群号 / QQ号 / 昵称关键词；若匹配多个会返回候选。",
+        ));
+        tool_descs.push((
+            "onebot_friend_request_approve",
+            "Approve/reject QQ friend requests via OneBot v11 (set_friend_add_request)。常用于处理系统推送的好友申请通知。",
+        ));
+    }
+
     if !config.agents.is_empty() {
         tool_descs.push((
             "delegate",
@@ -1697,7 +2012,20 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
 
-    let (onebot_admin_users, onebot_admin_only_tools, onebot_non_admin_context_file) = config
+    let onebot_model_vision_enabled = config
+        .channels_config
+        .onebot_v11
+        .as_ref()
+        .is_some_and(|_| onebot_model_vision_enabled(&config, &model));
+
+    let (
+        onebot_admin_users,
+        onebot_admin_only_tools,
+        onebot_non_admin_context_file,
+        onebot_message_merge_window_secs,
+        onebot_interrupt_on_recall,
+        onebot_vision_input_requested,
+    ) = config
         .channels_config
         .onebot_v11
         .as_ref()
@@ -1720,15 +2048,27 @@ pub async fn start_channels(config: Config) -> Result<()> {
             } else {
                 context_file
             };
-            (admins, tools, context_file)
+            (
+                admins,
+                tools,
+                context_file,
+                cfg.message_merge_window_secs,
+                cfg.interrupt_on_recall,
+                cfg.vision_input_enabled,
+            )
         })
         .unwrap_or_else(|| {
             (
                 vec![],
                 HashSet::new(),
                 DEFAULT_NON_ADMIN_CONTEXT_FILE.to_string(),
+                0,
+                false,
+                false,
             )
         });
+
+    let onebot_vision_input_enabled = onebot_vision_input_requested && onebot_model_vision_enabled;
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -1748,6 +2088,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
         onebot_admin_only_tools: Arc::new(onebot_admin_only_tools),
         onebot_non_admin_context_file: Arc::new(onebot_non_admin_context_file),
         onebot_command_external_network_access,
+        onebot_message_merge_window_secs,
+        onebot_interrupt_on_recall,
+        onebot_vision_input_requested,
+        onebot_vision_input_enabled,
+        onebot_model_vision_enabled,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -2059,6 +2404,11 @@ mod tests {
             onebot_admin_only_tools: Arc::new(std::collections::HashSet::new()),
             onebot_non_admin_context_file: Arc::new(DEFAULT_NON_ADMIN_CONTEXT_FILE.to_string()),
             onebot_command_external_network_access: OneBotCommandExternalNetworkAccess::Off,
+            onebot_message_merge_window_secs: 0,
+            onebot_interrupt_on_recall: false,
+            onebot_vision_input_requested: false,
+            onebot_vision_input_enabled: false,
+            onebot_model_vision_enabled: false,
         });
 
         process_channel_message(
@@ -2109,6 +2459,11 @@ mod tests {
             onebot_admin_only_tools: Arc::new(std::collections::HashSet::new()),
             onebot_non_admin_context_file: Arc::new(DEFAULT_NON_ADMIN_CONTEXT_FILE.to_string()),
             onebot_command_external_network_access: OneBotCommandExternalNetworkAccess::Off,
+            onebot_message_merge_window_secs: 0,
+            onebot_interrupt_on_recall: false,
+            onebot_vision_input_requested: false,
+            onebot_vision_input_enabled: false,
+            onebot_model_vision_enabled: false,
         });
 
         process_channel_message(
@@ -2213,6 +2568,11 @@ mod tests {
             onebot_admin_only_tools: Arc::new(std::collections::HashSet::new()),
             onebot_non_admin_context_file: Arc::new(DEFAULT_NON_ADMIN_CONTEXT_FILE.to_string()),
             onebot_command_external_network_access: OneBotCommandExternalNetworkAccess::Off,
+            onebot_message_merge_window_secs: 0,
+            onebot_interrupt_on_recall: false,
+            onebot_vision_input_requested: false,
+            onebot_vision_input_enabled: false,
+            onebot_model_vision_enabled: false,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);

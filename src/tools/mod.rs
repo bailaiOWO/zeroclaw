@@ -19,6 +19,7 @@ pub mod image_info;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
+pub mod onebot;
 pub mod pushover;
 pub mod schedule;
 pub mod schema;
@@ -47,6 +48,7 @@ pub use image_info::ImageInfoTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
+pub use onebot::{OneBotContactSearchTool, OneBotFriendRequestApproveTool, OneBotSendToTool};
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
@@ -152,6 +154,21 @@ pub fn all_tools_with_runtime(
         )),
     ];
 
+    if config.channels_config.onebot_v11.is_some() {
+        tools.push(Box::new(OneBotContactSearchTool::new(
+            config.clone(),
+            security.clone(),
+        )));
+        tools.push(Box::new(OneBotSendToTool::new(
+            config.clone(),
+            security.clone(),
+        )));
+        tools.push(Box::new(OneBotFriendRequestApproveTool::new(
+            config.clone(),
+            security.clone(),
+        )));
+    }
+
     if browser_config.enabled {
         // Add legacy browser_open tool for simple URL opening
         tools.push(Box::new(BrowserOpenTool::new(
@@ -225,7 +242,9 @@ pub fn all_tools_with_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BrowserConfig, Config, MemoryConfig};
+    use crate::config::{
+        BrowserConfig, Config, MemoryConfig, OneBotCommandExternalNetworkAccess, OneBotV11Config,
+    };
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Config {
@@ -318,6 +337,60 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
         assert!(names.contains(&"pushover"));
+    }
+
+    #[test]
+    fn all_tools_includes_onebot_tools_when_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+
+        let mut cfg_for_tools = Config::default();
+        cfg_for_tools.channels_config.onebot_v11 = Some(OneBotV11Config {
+            api_url: "http://127.0.0.1:3000".to_string(),
+            access_token: None,
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: 8096,
+            allowed_users: vec!["*".to_string()],
+            allowed_groups: vec![],
+            require_at_in_group: false,
+            admin_users: vec![],
+            admin_only_tools: vec![],
+            command_external_network_access: OneBotCommandExternalNetworkAccess::Off,
+            non_admin_context_file: "NON_ADMIN.md".to_string(),
+            message_merge_window_secs: 10,
+            interrupt_on_recall: true,
+            vision_input_enabled: false,
+            friend_request_notify_mode: crate::config::OneBotFriendRequestNotifyMode::AllAdmins,
+            friend_request_notify_targets: vec![],
+        });
+
+        let cfg = test_config(&tmp);
+        let tools = all_tools(
+            Arc::new(cfg_for_tools),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"onebot_contact_search"));
+        assert!(names.contains(&"onebot_send_to"));
+        assert!(names.contains(&"onebot_friend_request_approve"));
     }
 
     #[test]

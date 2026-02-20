@@ -4,7 +4,9 @@ use anyhow::{Context, Result};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -1200,6 +1202,9 @@ pub struct ModelRouteConfig {
     pub provider: String,
     /// Model to use with that provider
     pub model: String,
+    /// Whether this routed model is vision-capable (can handle image inputs).
+    #[serde(default)]
+    pub vision: bool,
     /// Optional API key override for this route's provider
     #[serde(default)]
     pub api_key: Option<String>,
@@ -1716,6 +1721,14 @@ pub enum OneBotCommandExternalNetworkAccess {
     AdminOnly,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OneBotFriendRequestNotifyMode {
+    #[default]
+    AllAdmins,
+    SpecificAccounts,
+}
+
 /// OneBot v11 configuration (NapCat / go-cqhttp compatible).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OneBotV11Config {
@@ -1755,8 +1768,28 @@ pub struct OneBotV11Config {
     pub command_external_network_access: OneBotCommandExternalNetworkAccess,
     #[serde(default = "default_onebot_non_admin_context_file")]
     pub non_admin_context_file: String,
+    /// Sliding merge window for consecutive user messages (seconds).
+    ///
+    /// If the same sender keeps sending within this window, those messages are
+    /// merged into a single model request. Set to 0 to disable.
+    #[serde(default = "default_onebot_message_merge_window_secs")]
+    pub message_merge_window_secs: u64,
+    /// When true, a recall/withdraw event interrupts in-flight model replies
+    /// for that OneBot conversation session.
+    #[serde(default = "default_onebot_interrupt_on_recall")]
+    pub interrupt_on_recall: bool,
+    /// Whether incoming image markers are forwarded as visual inputs in prompts.
+    ///
+    /// Effective only when the active model is vision-capable.
+    #[serde(default = "default_onebot_vision_input_enabled")]
+    pub vision_input_enabled: bool,
+    /// Friend request notification delivery scope.
+    #[serde(default)]
+    pub friend_request_notify_mode: OneBotFriendRequestNotifyMode,
+    /// Target QQ accounts used when `friend_request_notify_mode = "specific_accounts"`.
+    #[serde(default)]
+    pub friend_request_notify_targets: Vec<String>,
 }
-
 fn default_onebot_listen_host() -> String {
     "0.0.0.0".to_string()
 }
@@ -1771,6 +1804,18 @@ fn default_onebot_require_at_in_group() -> bool {
 
 fn default_onebot_non_admin_context_file() -> String {
     "NON_ADMIN.md".to_string()
+}
+
+fn default_onebot_message_merge_window_secs() -> u64 {
+    10
+}
+
+fn default_onebot_interrupt_on_recall() -> bool {
+    true
+}
+
+fn default_onebot_vision_input_enabled() -> bool {
+    false
 }
 
 // ── Config impl ──────────────────────────────────────────────────
@@ -3897,6 +3942,13 @@ api_url = "http://127.0.0.1:3000"
             OneBotCommandExternalNetworkAccess::Off
         );
         assert_eq!(parsed.non_admin_context_file, "NON_ADMIN.md");
+        assert_eq!(parsed.message_merge_window_secs, 10);
+        assert!(parsed.interrupt_on_recall);
+        assert!(!parsed.vision_input_enabled);
+        assert_eq!(
+            parsed.friend_request_notify_mode,
+            OneBotFriendRequestNotifyMode::AllAdmins
+        );
     }
 
     #[test]
@@ -3913,6 +3965,11 @@ api_url = "http://127.0.0.1:3000"
             admin_only_tools: vec!["shell".into(), "schedule".into()],
             command_external_network_access: OneBotCommandExternalNetworkAccess::AdminOnly,
             non_admin_context_file: "contexts/non_admin.md".into(),
+            message_merge_window_secs: 12,
+            interrupt_on_recall: false,
+            vision_input_enabled: true,
+            friend_request_notify_mode: OneBotFriendRequestNotifyMode::SpecificAccounts,
+            friend_request_notify_targets: vec!["12345".into(), "54321".into()],
         };
         let toml = toml::to_string(&cfg).unwrap();
         let parsed: OneBotV11Config = toml::from_str(&toml).unwrap();
@@ -3927,6 +3984,14 @@ api_url = "http://127.0.0.1:3000"
             OneBotCommandExternalNetworkAccess::AdminOnly
         );
         assert_eq!(parsed.non_admin_context_file, "contexts/non_admin.md");
+        assert_eq!(parsed.message_merge_window_secs, 12);
+        assert!(!parsed.interrupt_on_recall);
+        assert!(parsed.vision_input_enabled);
+        assert_eq!(
+            parsed.friend_request_notify_mode,
+            OneBotFriendRequestNotifyMode::SpecificAccounts
+        );
+        assert_eq!(parsed.friend_request_notify_targets, vec!["12345", "54321"]);
     }
 
     // ── Config file permission hardening (Unix only) ───────────────

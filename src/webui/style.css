@@ -203,35 +203,46 @@ button,input,textarea,select{font:inherit;color:inherit}
 .expandable-item.expanded .chevron-icon{transform:rotate(180deg)}
 
 /* ══ Context Files ══ */
-.context-files-layout{display:flex;gap:12px;min-height:520px}
-.context-files-sidebar{
-  width:260px;flex-shrink:0;overflow-y:auto;
-  border:1px solid var(--md-outline-variant);border-radius:var(--md-corner-m);
-  background:var(--md-surface-container-low);
-  padding:8px;
-}
-.context-file-item{
-  width:100%;border:none;text-align:left;cursor:pointer;
-  border-radius:var(--md-corner-s);padding:10px 12px;background:transparent;
-  color:var(--md-on-surface);font:500 13px/18px system-ui,sans-serif;
-}
-.context-file-item:hover{background:var(--md-surface-container-high)}
-.context-file-item.active{background:var(--md-secondary-container);color:var(--md-on-secondary-container)}
-.context-file-sub{font:400 11px/15px system-ui,sans-serif;color:var(--md-on-surface-variant);margin-top:2px;word-break:break-all}
-.context-file-item.active .context-file-sub{color:color-mix(in srgb, var(--md-on-secondary-container) 80%, transparent)}
-
 .context-files-content{flex:1;display:flex;flex-direction:column;min-width:0;gap:10px}
 .context-files-toolbar{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
 .context-title{font:600 15px/20px system-ui,sans-serif;color:var(--md-on-surface)}
 .context-meta{font:400 12px/16px system-ui,sans-serif;color:var(--md-on-surface-variant);word-break:break-all}
-.context-file-content{
-  flex:1;min-height:320px;max-height:540px;overflow:auto;
-  margin:0;padding:14px;border-radius:var(--md-corner-m);
+.context-flow{display:flex;flex-direction:column;gap:10px;min-height:320px}
+.context-flow-card{
+  border:1px solid var(--md-outline-variant);
+  border-radius:var(--md-corner-m);
+  background:var(--md-surface-container-low);
+  overflow:hidden;
+}
+.context-flow-header{
+  display:flex;align-items:flex-start;gap:12px;
+  padding:12px 14px;cursor:pointer;
+}
+.context-flow-header:hover{background:color-mix(in srgb, var(--md-primary) 6%, transparent)}
+.context-flow-order{
+  width:28px;height:28px;border-radius:var(--md-corner-full);
+  background:var(--md-primary-container);color:var(--md-on-primary-container);
+  font:700 13px/28px system-ui,sans-serif;text-align:center;flex-shrink:0;
+}
+.context-flow-main{min-width:0;flex:1;display:flex;flex-direction:column;gap:2px}
+.context-flow-title{font:600 14px/20px system-ui,sans-serif;color:var(--md-on-surface)}
+.context-flow-subtitle{font:400 12px/17px system-ui,sans-serif;color:var(--md-on-surface-variant)}
+.context-flow-meta{font:400 11px/16px ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--md-on-surface-variant)}
+.context-flow-body-wrapper{display:grid;grid-template-rows:0fr;transition:grid-template-rows .25s ease}
+.context-flow-card.expanded .context-flow-body-wrapper{grid-template-rows:1fr}
+.context-flow-body{overflow:hidden;padding:0 14px 14px;border-top:1px solid var(--md-outline-variant);background:var(--md-surface-container-lowest)}
+.context-flow-content{
+  margin:10px 0 0;padding:12px;border-radius:var(--md-corner-s);
   border:1px solid var(--md-outline-variant);
   background:var(--md-surface-container-low);
   color:var(--md-on-surface);font:400 13px/20px ui-monospace,SFMono-Regular,Consolas,monospace;
   white-space:pre-wrap;word-break:break-word;
+  max-height:360px;overflow:auto;
 }
+.context-flow-source{margin-top:8px;font:400 12px/16px system-ui,sans-serif;color:var(--md-on-surface-variant);word-break:break-all}
+.context-flow-arrow{display:flex;justify-content:center;color:var(--md-on-surface-variant);opacity:.7}
+.context-flow-arrow .material-symbols-outlined{font-size:22px}
+
 .context-notes{display:flex;flex-direction:column;gap:6px}
 .context-note{
   border:1px solid var(--md-outline-variant);border-radius:var(--md-corner-s);
@@ -335,8 +346,7 @@ button,input,textarea,select{font:inherit;color:inherit}
 }
 
 @media(max-width:900px){
-  .context-files-layout{flex-direction:column;min-height:unset}
-  .context-files-sidebar{width:100%;max-height:220px}
+  .context-flow-content{max-height:300px}
 }
 
 .expandable-item.config-item { box-sizing: border-box; width: 100%; max-width: 100%; overflow: hidden; word-break: break-all; }
@@ -497,7 +507,7 @@ button,input,textarea,select{font:inherit;color:inherit}
   .card-header{margin-bottom:12px}
   .model-route-row{grid-template-columns:1fr}
   .model-route-row .btn{justify-self:flex-start}
-  .context-file-content{min-height:260px}
+
   .chat-input-bar{padding:12px}
   .message{max-width:92%}
 }
