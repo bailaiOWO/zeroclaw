@@ -34,6 +34,7 @@ pub use whatsapp::WhatsAppChannel;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
 use crate::config::{Config, OneBotCommandExternalNetworkAccess};
+use crate::context_files;
 use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::{self, Observer};
@@ -46,7 +47,6 @@ use anyhow::{Context, Result};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
-use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -68,7 +68,7 @@ const CHANNEL_AUTOSAVE_MAX_CHARS: usize = 4_000;
 const CHANNEL_PARALLELISM_PER_CHANNEL: usize = 4;
 const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
-const DEFAULT_NON_ADMIN_CONTEXT_FILE: &str = "NON_ADMIN.md";
+const DEFAULT_NON_ADMIN_CONTEXT_FILE: &str = context_files::DEFAULT_NON_ADMIN_CONTEXT_FILE;
 const ONEBOT_SYNTHETIC_EVENT_PREFIX: &str = "[[onebot_event:";
 
 #[derive(Clone)]
@@ -147,11 +147,59 @@ struct StoredConversationTurn {
 
 async fn load_conversation_history(
     mem: &dyn Memory,
+    workspace_dir: &std::path::Path,
     session_id: &str,
     max_messages: usize,
 ) -> Vec<ChatMessage> {
     if max_messages == 0 {
         return Vec::new();
+    }
+
+    let label_group_senders = session_id
+        .split_once(':')
+        .map(|(_, rest)| rest.starts_with("group:"))
+        .unwrap_or(false);
+
+    if let Ok(mut turns) = context_files::read_session_turns(workspace_dir, session_id) {
+        if !turns.is_empty() {
+            if turns.len() > max_messages {
+                let split_at = turns.len() - max_messages;
+                turns = turns.split_off(split_at);
+            }
+
+            let mut out = Vec::with_capacity(turns.len());
+            for turn in turns {
+                let role = turn.role.trim().to_ascii_lowercase();
+                let text = turn.text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+
+                match role.as_str() {
+                    "assistant" => out.push(ChatMessage::assistant(text)),
+                    _ => {
+                        let formatted = if label_group_senders {
+                            match (
+                                turn.sender_name.as_deref().filter(|s| !s.trim().is_empty()),
+                                turn.sender_id.as_deref().filter(|s| !s.trim().is_empty()),
+                            ) {
+                                (Some(name), Some(id)) => format!("{name}({id}): {text}"),
+                                (Some(name), None) => format!("{name}: {text}"),
+                                (None, Some(id)) => format!("{id}: {text}"),
+                                (None, None) => text.to_string(),
+                            }
+                        } else {
+                            text.to_string()
+                        };
+                        out.push(ChatMessage::user(formatted));
+                    }
+                }
+            }
+
+            if !out.is_empty() {
+                return out;
+            }
+        }
     }
 
     let Ok(mut entries) = mem
@@ -167,11 +215,6 @@ async fn load_conversation_history(
     // Keep most-recent N (sqlite list is updated_at DESC)
     entries.truncate(max_messages);
     entries.reverse();
-
-    let label_group_senders = session_id
-        .split_once(':')
-        .map(|(_, rest)| rest.starts_with("group:"))
-        .unwrap_or(false);
 
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -383,6 +426,29 @@ fn normalize_tool_policy_name(name: &str) -> String {
     name.trim().to_ascii_lowercase()
 }
 
+fn normalize_protected_prompt_path(path: &str) -> String {
+    path.trim()
+        .trim_start_matches("./")
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+}
+
+fn onebot_protected_prompt_paths() -> HashSet<String> {
+    let mut protected = context_files::protected_prompt_relative_paths()
+        .into_iter()
+        .map(|path| normalize_protected_prompt_path(&path))
+        .collect::<HashSet<_>>();
+    protected.insert(normalize_protected_prompt_path(&format!(
+        "{}/",
+        context_files::CONTEXT_DIR
+    )));
+    protected.insert(normalize_protected_prompt_path(&format!(
+        "{}/",
+        context_files::SESSIONS_DIR
+    )));
+    protected
+}
+
 fn is_onebot_admin_sender(msg: &traits::ChannelMessage, admin_users: &[String]) -> bool {
     if msg.channel != "onebot_v11" || admin_users.is_empty() {
         return false;
@@ -459,11 +525,8 @@ fn build_non_admin_context_message(
     } else {
         configured
     };
-    let abs_path = if Path::new(relative).is_absolute() {
-        PathBuf::from(relative)
-    } else {
-        ctx.workspace_dir.join(relative)
-    };
+    let abs_path =
+        context_files::resolve_non_admin_context_path(ctx.workspace_dir.as_ref(), relative);
 
     if let Ok(content) = std::fs::read_to_string(&abs_path) {
         let trimmed = content.trim();
@@ -623,7 +686,13 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
 
     let history_limit = ctx.max_history_messages.min(CHANNEL_MAX_HISTORY_MESSAGES);
     let conversation_history = if ctx.auto_save_memory {
-        load_conversation_history(ctx.memory.as_ref(), &session_id, history_limit).await
+        load_conversation_history(
+            ctx.memory.as_ref(),
+            ctx.workspace_dir.as_ref(),
+            &session_id,
+            history_limit,
+        )
+        .await
     } else {
         Vec::new()
     };
@@ -640,7 +709,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             reply_target: Some(msg.reply_target.clone()),
             timestamp: Some(msg.timestamp),
         })
-        .unwrap_or(stored_text);
+        .unwrap_or_else(|_| stored_text.clone());
         let _ = ctx
             .memory
             .store(
@@ -650,6 +719,20 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 Some(&session_id),
             )
             .await;
+
+        let _ = context_files::append_session_turn(
+            ctx.workspace_dir.as_ref(),
+            &session_id,
+            &context_files::SessionTurn {
+                role: "user".to_string(),
+                text: stored_text,
+                sender_id: Some(msg.sender.clone()),
+                sender_name: msg.sender_name.clone(),
+                channel: Some(msg.channel.clone()),
+                reply_target: Some(msg.reply_target.clone()),
+                timestamp: Some(msg.timestamp),
+            },
+        );
     }
 
     let user_content = if msg.channel == "onebot_v11" {
@@ -699,6 +782,13 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         Some(&blocked_tools)
     };
 
+    let protected_prompt_paths = if onebot_policy_enabled && !sender_is_admin {
+        Some(onebot_protected_prompt_paths())
+    } else {
+        None
+    };
+    let protected_prompt_paths_ref = protected_prompt_paths.as_ref();
+
     let system_prompt = compose_system_prompt_for_channel(ctx.system_prompt.as_str(), &msg.channel);
 
     let mut history = Vec::with_capacity(2 + conversation_history.len());
@@ -738,6 +828,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             ctx.max_tool_iterations,
             blocked_tools_ref,
             external_network_command_allowed,
+            protected_prompt_paths_ref,
         ),
     )
     .await;
@@ -768,7 +859,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                     reply_target: Some(msg.reply_target.clone()),
                     timestamp: Some(now_unix_secs()),
                 })
-                .unwrap_or(stored_text);
+                .unwrap_or_else(|_| stored_text.clone());
                 let _ = ctx
                     .memory
                     .store(
@@ -778,6 +869,20 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                         Some(&session_id),
                     )
                     .await;
+
+                let _ = context_files::append_session_turn(
+                    ctx.workspace_dir.as_ref(),
+                    &session_id,
+                    &context_files::SessionTurn {
+                        role: "assistant".to_string(),
+                        text: stored_text,
+                        sender_id: None,
+                        sender_name: None,
+                        channel: Some(msg.channel.clone()),
+                        reply_target: Some(msg.reply_target.clone()),
+                        timestamp: Some(now_unix_secs()),
+                    },
+                );
             }
             if let Some(channel) = target_channel.as_ref() {
                 if let Err(e) = channel
@@ -1045,8 +1150,9 @@ fn load_openclaw_bootstrap_files(
     }
 
     // BOOTSTRAP.md — only if it exists (first-run ritual)
-    let bootstrap_path = workspace_dir.join("BOOTSTRAP.md");
-    if bootstrap_path.exists() {
+    let bootstrap_path =
+        context_files::resolve_context_file_for_read(workspace_dir, "BOOTSTRAP.md");
+    if bootstrap_path.is_file() {
         inject_workspace_file(prompt, workspace_dir, "BOOTSTRAP.md", max_chars_per_file);
     }
 
@@ -1251,7 +1357,7 @@ fn inject_workspace_file(
 ) {
     use std::fmt::Write;
 
-    let path = workspace_dir.join(filename);
+    let path = context_files::resolve_context_file_for_read(workspace_dir, filename);
     match std::fs::read_to_string(&path) {
         Ok(content) => {
             let trimmed = content.trim();
@@ -2119,22 +2225,43 @@ mod tests {
 
     fn make_workspace() -> TempDir {
         let tmp = TempDir::new().unwrap();
-        // Create minimal workspace files
-        std::fs::write(tmp.path().join("SOUL.md"), "# Soul\nBe helpful.").unwrap();
-        std::fs::write(tmp.path().join("IDENTITY.md"), "# Identity\nName: ZeroClaw").unwrap();
-        std::fs::write(tmp.path().join("USER.md"), "# User\nName: Test User").unwrap();
+        let _ = context_files::ensure_context_dir(tmp.path());
+        // Create minimal workspace files (new location: contexts/)
         std::fs::write(
-            tmp.path().join("AGENTS.md"),
+            context_files::preferred_context_file_path(tmp.path(), "SOUL.md"),
+            "# Soul\nBe helpful.",
+        )
+        .unwrap();
+        std::fs::write(
+            context_files::preferred_context_file_path(tmp.path(), "IDENTITY.md"),
+            "# Identity\nName: ZeroClaw",
+        )
+        .unwrap();
+        std::fs::write(
+            context_files::preferred_context_file_path(tmp.path(), "USER.md"),
+            "# User\nName: Test User",
+        )
+        .unwrap();
+        std::fs::write(
+            context_files::preferred_context_file_path(tmp.path(), "AGENTS.md"),
             "# Agents\nFollow instructions.",
         )
         .unwrap();
-        std::fs::write(tmp.path().join("TOOLS.md"), "# Tools\nUse shell carefully.").unwrap();
         std::fs::write(
-            tmp.path().join("HEARTBEAT.md"),
+            context_files::preferred_context_file_path(tmp.path(), "TOOLS.md"),
+            "# Tools\nUse shell carefully.",
+        )
+        .unwrap();
+        std::fs::write(
+            context_files::preferred_context_file_path(tmp.path(), "HEARTBEAT.md"),
             "# Heartbeat\nCheck status.",
         )
         .unwrap();
-        std::fs::write(tmp.path().join("MEMORY.md"), "# Memory\nUser likes Rust.").unwrap();
+        std::fs::write(
+            context_files::preferred_context_file_path(tmp.path(), "MEMORY.md"),
+            "# Memory\nUser likes Rust.",
+        )
+        .unwrap();
         tmp
     }
 
@@ -2215,6 +2342,17 @@ mod tests {
             OneBotCommandExternalNetworkAccess::AdminOnly,
             false
         ));
+    }
+
+    #[test]
+    fn onebot_protected_prompt_paths_cover_context_and_legacy_locations() {
+        let protected = onebot_protected_prompt_paths();
+        assert!(protected.contains("contexts/agents.md"));
+        assert!(protected.contains("agents.md"));
+        assert!(protected.contains("contexts/"));
+        assert!(protected.contains("contexts/non_admin.md"));
+        assert!(protected.contains("sessions/"));
+        assert!(protected.contains("non_admin.md"));
     }
 
     #[derive(Default)]
@@ -2701,7 +2839,11 @@ mod tests {
         );
 
         // Create BOOTSTRAP.md — should appear
-        std::fs::write(ws.path().join("BOOTSTRAP.md"), "# Bootstrap\nFirst run.").unwrap();
+        std::fs::write(
+            context_files::preferred_context_file_path(ws.path(), "BOOTSTRAP.md"),
+            "# Bootstrap\nFirst run.",
+        )
+        .unwrap();
         let prompt2 = build_system_prompt(ws.path(), "model", &[], &[], None, None);
         assert!(
             prompt2.contains("### BOOTSTRAP.md"),
@@ -2778,7 +2920,11 @@ mod tests {
         let ws = make_workspace();
         // Write a file larger than BOOTSTRAP_MAX_CHARS
         let big_content = "x".repeat(BOOTSTRAP_MAX_CHARS + 1000);
-        std::fs::write(ws.path().join("AGENTS.md"), &big_content).unwrap();
+        std::fs::write(
+            context_files::preferred_context_file_path(ws.path(), "AGENTS.md"),
+            &big_content,
+        )
+        .unwrap();
 
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
@@ -2795,7 +2941,11 @@ mod tests {
     #[test]
     fn prompt_empty_files_skipped() {
         let ws = make_workspace();
-        std::fs::write(ws.path().join("TOOLS.md"), "").unwrap();
+        std::fs::write(
+            context_files::preferred_context_file_path(ws.path(), "TOOLS.md"),
+            "",
+        )
+        .unwrap();
 
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 

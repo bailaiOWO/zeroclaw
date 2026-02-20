@@ -28,7 +28,8 @@ mod tests {
             .await
             .unwrap();
 
-        let heartbeat_path = workspace.join("HEARTBEAT.md");
+        let heartbeat_path =
+            crate::context_files::preferred_context_file_path(workspace, "HEARTBEAT.md");
         assert!(heartbeat_path.exists());
     }
 }

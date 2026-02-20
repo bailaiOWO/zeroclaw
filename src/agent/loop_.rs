@@ -255,11 +255,38 @@ fn now_unix_secs() -> u64 {
 
 async fn load_session_conversation_history(
     mem: &dyn Memory,
+    workspace_dir: &std::path::Path,
     session_id: &str,
     max_messages: usize,
 ) -> Vec<ChatMessage> {
     if max_messages == 0 {
         return Vec::new();
+    }
+
+    if let Ok(mut turns) = crate::context_files::read_session_turns(workspace_dir, session_id) {
+        if !turns.is_empty() {
+            if turns.len() > max_messages {
+                let split_at = turns.len() - max_messages;
+                turns = turns.split_off(split_at);
+            }
+
+            let mut out = Vec::with_capacity(turns.len());
+            for turn in turns {
+                let text = turn.text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                if turn.role.trim().eq_ignore_ascii_case("assistant") {
+                    out.push(ChatMessage::assistant(text));
+                } else {
+                    out.push(ChatMessage::user(text));
+                }
+            }
+
+            if !out.is_empty() {
+                return out;
+            }
+        }
     }
 
     let Ok(mut entries) = mem
@@ -307,15 +334,18 @@ async fn load_session_conversation_history(
 
 async fn persist_session_conversation_turn(
     mem: &dyn Memory,
+    workspace_dir: &std::path::Path,
     session_id: &str,
-    role: &str,
+    role_raw: &str,
     text: &str,
 ) {
     let trimmed = truncate_with_ellipsis(text, PROCESS_MESSAGE_AUTOSAVE_MAX_CHARS);
     if trimmed.trim().is_empty() {
         return;
     }
+    let timestamp = now_unix_secs();
 
+    let role = role_raw.trim().to_ascii_lowercase();
     let key = if role == "assistant" {
         format!("session_{}_assistant", autosave_memory_key("msg"))
     } else {
@@ -325,9 +355,9 @@ async fn persist_session_conversation_turn(
     let stored = serde_json::to_string(&StoredConversationTurn {
         role: role.to_string(),
         text: trimmed.clone(),
-        timestamp: Some(now_unix_secs()),
+        timestamp: Some(timestamp),
     })
-    .unwrap_or(trimmed);
+    .unwrap_or_else(|_| trimmed.clone());
 
     let _ = mem
         .store(
@@ -337,6 +367,20 @@ async fn persist_session_conversation_turn(
             Some(session_id),
         )
         .await;
+
+    let _ = crate::context_files::append_session_turn(
+        workspace_dir,
+        session_id,
+        &crate::context_files::SessionTurn {
+            role,
+            text: trimmed,
+            sender_id: None,
+            sender_name: None,
+            channel: None,
+            reply_target: None,
+            timestamp: Some(timestamp),
+        },
+    );
 }
 
 /// Build hardware datasheet context from RAG when peripherals are enabled.
@@ -396,6 +440,22 @@ fn external_network_command_denied_message() -> String {
     "Denied: external-network command access is disabled for this conversation.".to_string()
 }
 
+fn protected_prompt_file_denied_message() -> String {
+    "Denied: prompt context files are protected and can only be accessed in administrator conversations."
+        .to_string()
+}
+
+fn normalize_protected_prompt_path(path: &str) -> String {
+    let mut normalized = path.trim().replace('\\', "/").to_ascii_lowercase();
+    while normalized.starts_with("./") {
+        normalized = normalized[2..].to_string();
+    }
+    while normalized.starts_with('/') {
+        normalized = normalized[1..].to_string();
+    }
+    normalized
+}
+
 fn extract_tool_command_argument(arguments: &serde_json::Value) -> Option<&str> {
     arguments
         .get("command")
@@ -426,6 +486,56 @@ fn is_external_network_command_call(call: &ParsedToolCall) -> bool {
 
     extract_tool_command_argument(&call.arguments)
         .is_some_and(SecurityPolicy::command_uses_external_network)
+}
+
+fn extract_tool_path_argument(arguments: &serde_json::Value) -> Option<&str> {
+    arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+}
+
+fn path_hits_protected_prompt_file(path: &str, protected_prompt_paths: &HashSet<String>) -> bool {
+    let normalized = normalize_protected_prompt_path(path);
+    protected_prompt_paths.iter().any(|protected| {
+        if protected.ends_with('/') {
+            normalized.starts_with(protected) || normalized.contains(&format!("/{protected}"))
+        } else {
+            normalized == *protected || normalized.ends_with(&format!("/{protected}"))
+        }
+    })
+}
+
+fn command_hits_protected_prompt_file(
+    command: &str,
+    protected_prompt_paths: &HashSet<String>,
+) -> bool {
+    let normalized = normalize_protected_prompt_path(command);
+    protected_prompt_paths
+        .iter()
+        .any(|protected| !protected.is_empty() && normalized.contains(protected))
+}
+
+fn is_prompt_file_access_call(
+    call: &ParsedToolCall,
+    protected_prompt_paths: Option<&HashSet<String>>,
+) -> bool {
+    let Some(protected_prompt_paths) = protected_prompt_paths else {
+        return false;
+    };
+
+    let normalized_tool_name = normalize_tool_name_for_policy(&call.name);
+    if matches!(normalized_tool_name.as_str(), "file_read" | "file_write") {
+        return extract_tool_path_argument(&call.arguments)
+            .is_some_and(|path| path_hits_protected_prompt_file(path, protected_prompt_paths));
+    }
+
+    matches!(
+        normalized_tool_name.as_str(),
+        "shell" | "cron_add" | "cron_update" | "schedule"
+    ) && extract_tool_command_argument(&call.arguments)
+        .is_some_and(|command| command_hits_protected_prompt_file(command, protected_prompt_paths))
 }
 
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
@@ -776,6 +886,7 @@ pub(crate) async fn agent_turn(
         DEFAULT_MAX_TOOL_ITERATIONS,
         None,
         false,
+        None,
     )
     .await
 }
@@ -797,6 +908,7 @@ pub(crate) async fn run_tool_call_loop(
     max_tool_iterations: usize,
     blocked_tools: Option<&HashSet<String>>,
     allow_external_network_commands: bool,
+    protected_prompt_paths: Option<&HashSet<String>>,
 ) -> Result<String> {
     // Build native tool definitions once if the provider supports them.
     let tool_definitions = if provider.supports_native_tools() && !tools_registry.is_empty() {
@@ -950,6 +1062,17 @@ pub(crate) async fn run_tool_call_loop(
 
             if !allow_external_network_commands && is_external_network_command_call(call) {
                 let denied = external_network_command_denied_message();
+                individual_results.push(denied.clone());
+                let _ = writeln!(
+                    tool_results,
+                    "<tool_result name=\"{}\">\n{denied}\n</tool_result>",
+                    call.name
+                );
+                continue;
+            }
+
+            if is_prompt_file_access_call(call, protected_prompt_paths) {
+                let denied = protected_prompt_file_denied_message();
                 individual_results.push(denied.clone());
                 let _ = writeln!(
                     tool_results,
@@ -1378,6 +1501,7 @@ pub async fn run(
             config.agent.max_tool_iterations,
             None,
             false,
+            None,
         )
         .await?;
         final_output = response.clone();
@@ -1504,6 +1628,7 @@ pub async fn run(
                 config.agent.max_tool_iterations,
                 None,
                 false,
+                None,
             )
             .await
             {
@@ -1725,8 +1850,13 @@ pub async fn process_message_with_session(
     let session_id = session_id.map(str::to_string);
     let conversation_history = if config.memory.auto_save {
         if let Some(sid) = session_id.as_deref() {
-            load_session_conversation_history(mem.as_ref(), sid, config.agent.max_history_messages)
-                .await
+            load_session_conversation_history(
+                mem.as_ref(),
+                &config.workspace_dir,
+                sid,
+                config.agent.max_history_messages,
+            )
+            .await
         } else {
             Vec::new()
         }
@@ -1749,7 +1879,14 @@ pub async fn process_message_with_session(
 
     if config.memory.auto_save {
         if let Some(sid) = session_id.as_deref() {
-            persist_session_conversation_turn(mem.as_ref(), sid, "user", message).await;
+            persist_session_conversation_turn(
+                mem.as_ref(),
+                &config.workspace_dir,
+                sid,
+                "user",
+                message,
+            )
+            .await;
         }
     }
 
@@ -1772,7 +1909,14 @@ pub async fn process_message_with_session(
 
     if config.memory.auto_save {
         if let Some(sid) = session_id.as_deref() {
-            persist_session_conversation_turn(mem.as_ref(), sid, "assistant", &response).await;
+            persist_session_conversation_turn(
+                mem.as_ref(),
+                &config.workspace_dir,
+                sid,
+                "assistant",
+                &response,
+            )
+            .await;
         }
     }
 
@@ -1933,6 +2077,68 @@ mod tests {
             Ok(ToolResult {
                 success: true,
                 output: "executed".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    struct ProtectedPromptFileReadProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for ProtectedPromptFileReadProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(
+                "<tool_call>\n{\"name\":\"file_read\",\"arguments\":{\"path\":\"contexts/AGENTS.md\"}}\n</tool_call>"
+                    .to_string(),
+            )
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let has_tool_results = messages
+                .iter()
+                .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"));
+            if has_tool_results {
+                Ok("done".to_string())
+            } else {
+                self.chat_with_system(None, "", "", 0.0).await
+            }
+        }
+    }
+
+    struct FileReadCountingTool {
+        hits: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for FileReadCountingTool {
+        fn name(&self) -> &str {
+            "file_read"
+        }
+
+        fn description(&self) -> &str {
+            "mock file_read"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: "read".to_string(),
                 error: None,
             })
         }
@@ -2284,6 +2490,7 @@ Tail"#;
             3,
             Some(&blocked),
             false,
+            None,
         )
         .await
         .expect("loop should finish");
@@ -2320,6 +2527,7 @@ Tail"#;
             3,
             None,
             false,
+            None,
         )
         .await
         .expect("loop should finish");
@@ -2356,6 +2564,7 @@ Tail"#;
             3,
             None,
             true,
+            None,
         )
         .await
         .expect("loop should finish");
@@ -2366,6 +2575,76 @@ Tail"#;
             1,
             "shell network command should execute"
         );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_blocks_protected_prompt_file_access() {
+        let provider = ProtectedPromptFileReadProvider;
+        let observer = NoopObserver;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(FileReadCountingTool {
+            hits: Arc::clone(&hits),
+        })];
+        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("run tool")];
+        let protected: HashSet<String> =
+            ["contexts/agents.md".to_string(), "agents.md".to_string()]
+                .into_iter()
+                .collect();
+
+        let response = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "test-provider",
+            "test-model",
+            0.0,
+            true,
+            None,
+            "onebot_v11",
+            3,
+            None,
+            false,
+            Some(&protected),
+        )
+        .await
+        .expect("loop should finish");
+
+        assert_eq!(response, "done");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn protected_prompt_paths_support_dot_prefix_and_directory_prefix() {
+        let protected: HashSet<String> = [
+            "contexts/".to_string(),
+            "sessions/".to_string(),
+            "agents.md".to_string(),
+        ]
+        .into_iter()
+        .collect();
+
+        assert!(path_hits_protected_prompt_file(
+            "./contexts/AGENTS.md",
+            &protected
+        ));
+        assert!(path_hits_protected_prompt_file(
+            "workspace/contexts/AGENTS.md",
+            &protected
+        ));
+        assert!(path_hits_protected_prompt_file(
+            "sessions/onebot.md",
+            &protected
+        ));
+        assert!(path_hits_protected_prompt_file(
+            "tmp/sessions/onebot.md",
+            &protected
+        ));
+        assert!(path_hits_protected_prompt_file("AGENTS.md", &protected));
+        assert!(!path_hits_protected_prompt_file(
+            "memory/2026-01-01.md",
+            &protected
+        ));
     }
 
     #[test]

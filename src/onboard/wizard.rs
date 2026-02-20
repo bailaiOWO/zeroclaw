@@ -3549,7 +3549,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     admin_users: vec![],
                     admin_only_tools: vec![],
                     command_external_network_access: OneBotCommandExternalNetworkAccess::Off,
-                    non_admin_context_file: "NON_ADMIN.md".to_string(),
+                    non_admin_context_file: crate::context_files::DEFAULT_NON_ADMIN_CONTEXT_FILE
+                        .to_string(),
                     message_merge_window_secs: 10,
                     interrupt_on_recall: true,
                     vision_input_enabled: false,
@@ -4012,32 +4013,61 @@ pub(crate) fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> 
         ("NON_ADMIN.md", non_admin.to_string()),
     ];
 
-    // Create subdirectories
-    let subdirs = ["sessions", "memory", "state", "cron", "skills"];
+    // Create subdirectories (contexts/ stores injected prompt markdown files)
+    let subdirs = [
+        "sessions",
+        "memory",
+        "state",
+        "cron",
+        "skills",
+        crate::context_files::CONTEXT_DIR,
+    ];
     for dir in &subdirs {
         fs::create_dir_all(workspace_dir.join(dir))?;
     }
 
     let mut created = 0;
     let mut skipped = 0;
+    let mut migrated = 0;
 
     for (filename, content) in &files {
-        let path = workspace_dir.join(filename);
+        let path = crate::context_files::preferred_context_file_path(workspace_dir, filename);
+        let legacy_path = crate::context_files::legacy_context_file_path(workspace_dir, filename);
         if path.exists() {
             skipped += 1;
+        } else if legacy_path.exists() {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if fs::rename(&legacy_path, &path).is_err() {
+                fs::copy(&legacy_path, &path)?;
+                fs::remove_file(&legacy_path)?;
+            }
+            migrated += 1;
         } else {
             fs::write(&path, content)?;
             created += 1;
         }
     }
 
-    println!(
-        "  {} Created {} files, skipped {} existing | {} subdirectories",
-        style("✓").green().bold(),
-        style(created).green(),
-        style(skipped).dim(),
-        style(subdirs.len()).green()
-    );
+    if migrated > 0 {
+        println!(
+            "  {} Created {} files, migrated {} legacy files, skipped {} existing | {} subdirectories",
+            style("✓").green().bold(),
+            style(created).green(),
+            style(migrated).cyan(),
+            style(skipped).dim(),
+            style(subdirs.len()).green()
+        );
+    } else {
+        println!(
+            "  {} Created {} files, skipped {} existing | {} subdirectories",
+            style("✓").green().bold(),
+            style(created).green(),
+            style(skipped).dim(),
+            style(subdirs.len()).green()
+        );
+    }
 
     // Show workspace tree
     println!();
@@ -4055,7 +4085,10 @@ pub(crate) fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> 
         } else {
             "├──"
         };
-        println!("  {}", style(format!("  {prefix} {filename}")).dim());
+        println!(
+            "  {}",
+            style(format!("  {prefix} contexts/{filename}")).dim()
+        );
     }
 
     Ok(())
@@ -4338,6 +4371,14 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
+    fn context_file_path(base: &std::path::Path, filename: &str) -> std::path::PathBuf {
+        crate::context_files::preferred_context_file_path(base, filename)
+    }
+
+    fn read_context_file(base: &std::path::Path, filename: &str) -> String {
+        fs::read_to_string(context_file_path(base, filename)).unwrap()
+    }
+
     // ── ProjectContext defaults ──────────────────────────────────
 
     #[test]
@@ -4370,7 +4411,10 @@ mod tests {
             "NON_ADMIN.md",
         ];
         for f in &expected {
-            assert!(tmp.path().join(f).exists(), "missing file: {f}");
+            assert!(
+                context_file_path(tmp.path(), f).exists(),
+                "missing file: contexts/{f}"
+            );
         }
     }
 
@@ -4380,7 +4424,14 @@ mod tests {
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        for dir in &["sessions", "memory", "state", "cron", "skills"] {
+        for dir in &[
+            "sessions",
+            "memory",
+            "state",
+            "cron",
+            "skills",
+            crate::context_files::CONTEXT_DIR,
+        ] {
             assert!(tmp.path().join(dir).is_dir(), "missing subdirectory: {dir}");
         }
     }
@@ -4396,13 +4447,13 @@ mod tests {
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        let user_md = fs::read_to_string(context_file_path(tmp.path(), "USER.md")).unwrap();
         assert!(
             user_md.contains("**Name:** Alice"),
             "USER.md should contain user name"
         );
 
-        let bootstrap = fs::read_to_string(tmp.path().join("BOOTSTRAP.md")).unwrap();
+        let bootstrap = fs::read_to_string(context_file_path(tmp.path(), "BOOTSTRAP.md")).unwrap();
         assert!(
             bootstrap.contains("**Alice**"),
             "BOOTSTRAP.md should contain user name"
@@ -4418,13 +4469,13 @@ mod tests {
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        let user_md = fs::read_to_string(context_file_path(tmp.path(), "USER.md")).unwrap();
         assert!(
             user_md.contains("**Timezone:** US/Pacific"),
             "USER.md should contain timezone"
         );
 
-        let bootstrap = fs::read_to_string(tmp.path().join("BOOTSTRAP.md")).unwrap();
+        let bootstrap = fs::read_to_string(context_file_path(tmp.path(), "BOOTSTRAP.md")).unwrap();
         assert!(
             bootstrap.contains("US/Pacific"),
             "BOOTSTRAP.md should contain timezone"
@@ -4440,31 +4491,31 @@ mod tests {
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let identity = fs::read_to_string(tmp.path().join("IDENTITY.md")).unwrap();
+        let identity = fs::read_to_string(context_file_path(tmp.path(), "IDENTITY.md")).unwrap();
         assert!(
             identity.contains("**Name:** Crabby"),
             "IDENTITY.md should contain agent name"
         );
 
-        let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul = fs::read_to_string(context_file_path(tmp.path(), "SOUL.md")).unwrap();
         assert!(
             soul.contains("You are **Crabby**"),
             "SOUL.md should contain agent name"
         );
 
-        let agents = fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap();
+        let agents = fs::read_to_string(context_file_path(tmp.path(), "AGENTS.md")).unwrap();
         assert!(
             agents.contains("Crabby Personal Assistant"),
             "AGENTS.md should contain agent name"
         );
 
-        let heartbeat = fs::read_to_string(tmp.path().join("HEARTBEAT.md")).unwrap();
+        let heartbeat = fs::read_to_string(context_file_path(tmp.path(), "HEARTBEAT.md")).unwrap();
         assert!(
             heartbeat.contains("Crabby"),
             "HEARTBEAT.md should contain agent name"
         );
 
-        let bootstrap = fs::read_to_string(tmp.path().join("BOOTSTRAP.md")).unwrap();
+        let bootstrap = fs::read_to_string(context_file_path(tmp.path(), "BOOTSTRAP.md")).unwrap();
         assert!(
             bootstrap.contains("Introduce yourself as Crabby"),
             "BOOTSTRAP.md should contain agent name"
@@ -4480,19 +4531,19 @@ mod tests {
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul = fs::read_to_string(context_file_path(tmp.path(), "SOUL.md")).unwrap();
         assert!(
             soul.contains("Be technical and detailed."),
             "SOUL.md should contain communication style"
         );
 
-        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        let user_md = fs::read_to_string(context_file_path(tmp.path(), "USER.md")).unwrap();
         assert!(
             user_md.contains("Be technical and detailed."),
             "USER.md should contain communication style"
         );
 
-        let bootstrap = fs::read_to_string(tmp.path().join("BOOTSTRAP.md")).unwrap();
+        let bootstrap = fs::read_to_string(context_file_path(tmp.path(), "BOOTSTRAP.md")).unwrap();
         assert!(
             bootstrap.contains("Be technical and detailed."),
             "BOOTSTRAP.md should contain communication style"
@@ -4508,10 +4559,10 @@ mod tests {
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        let user_md = fs::read_to_string(context_file_path(tmp.path(), "USER.md")).unwrap();
         assert!(user_md.contains("**Preferred language:** 简体中文"));
 
-        let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul = fs::read_to_string(context_file_path(tmp.path(), "SOUL.md")).unwrap();
         assert!(soul.contains("Default language: 简体中文"));
     }
 
@@ -4523,13 +4574,13 @@ mod tests {
         let ctx = ProjectContext::default(); // all empty
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let identity = fs::read_to_string(tmp.path().join("IDENTITY.md")).unwrap();
+        let identity = fs::read_to_string(context_file_path(tmp.path(), "IDENTITY.md")).unwrap();
         assert!(
             identity.contains("**Name:** ZeroClaw"),
             "should default agent name to ZeroClaw"
         );
 
-        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        let user_md = fs::read_to_string(context_file_path(tmp.path(), "USER.md")).unwrap();
         assert!(
             user_md.contains("**Name:** User"),
             "should default user name to User"
@@ -4543,7 +4594,7 @@ mod tests {
             "should default communication language to English"
         );
 
-        let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul = fs::read_to_string(context_file_path(tmp.path(), "SOUL.md")).unwrap();
         assert!(
             soul.contains("Be warm, natural, and clear."),
             "should default communication style"
@@ -4561,7 +4612,7 @@ mod tests {
         };
 
         // Pre-create SOUL.md with custom content
-        let soul_path = tmp.path().join("SOUL.md");
+        let soul_path = context_file_path(tmp.path(), "SOUL.md");
         fs::write(&soul_path, "# My Custom Soul\nDo not overwrite me.").unwrap();
 
         scaffold_workspace(tmp.path(), &ctx).unwrap();
@@ -4578,7 +4629,7 @@ mod tests {
         );
 
         // But USER.md should be created fresh
-        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        let user_md = fs::read_to_string(context_file_path(tmp.path(), "USER.md")).unwrap();
         assert!(user_md.contains("**Name:** Bob"));
     }
 
@@ -4594,13 +4645,31 @@ mod tests {
         };
 
         scaffold_workspace(tmp.path(), &ctx).unwrap();
-        let soul_v1 = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul_v1 = fs::read_to_string(context_file_path(tmp.path(), "SOUL.md")).unwrap();
 
         // Run again — should not change anything
         scaffold_workspace(tmp.path(), &ctx).unwrap();
-        let soul_v2 = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul_v2 = fs::read_to_string(context_file_path(tmp.path(), "SOUL.md")).unwrap();
 
         assert_eq!(soul_v1, soul_v2, "scaffold should be idempotent");
+    }
+
+    #[test]
+    fn scaffold_migrates_legacy_root_context_files_into_contexts_dir() {
+        let tmp = TempDir::new().unwrap();
+        let legacy = tmp.path().join("SOUL.md");
+        fs::write(&legacy, "# legacy soul").unwrap();
+
+        scaffold_workspace(tmp.path(), &ProjectContext::default()).unwrap();
+
+        let migrated = context_file_path(tmp.path(), "SOUL.md");
+        assert!(migrated.is_file(), "legacy SOUL.md should be migrated");
+        let content = fs::read_to_string(migrated).unwrap();
+        assert!(content.contains("legacy soul"));
+        assert!(
+            !legacy.exists(),
+            "legacy root SOUL.md should be moved into contexts/"
+        );
     }
 
     // ── scaffold_workspace: all files are non-empty ─────────────
@@ -4622,7 +4691,7 @@ mod tests {
             "MEMORY.md",
             "NON_ADMIN.md",
         ] {
-            let content = fs::read_to_string(tmp.path().join(f)).unwrap();
+            let content = read_context_file(tmp.path(), f);
             assert!(!content.trim().is_empty(), "{f} should not be empty");
         }
     }
@@ -4635,7 +4704,7 @@ mod tests {
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let agents = fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap();
+        let agents = fs::read_to_string(context_file_path(tmp.path(), "AGENTS.md")).unwrap();
         assert!(
             agents.contains("memory_recall"),
             "AGENTS.md should reference memory_recall for on-demand access"
@@ -4654,7 +4723,7 @@ mod tests {
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let memory = fs::read_to_string(tmp.path().join("MEMORY.md")).unwrap();
+        let memory = fs::read_to_string(context_file_path(tmp.path(), "MEMORY.md")).unwrap();
         assert!(
             memory.contains("costs tokens"),
             "MEMORY.md should warn about token cost"
@@ -4673,7 +4742,7 @@ mod tests {
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let tools = fs::read_to_string(tmp.path().join("TOOLS.md")).unwrap();
+        let tools = fs::read_to_string(context_file_path(tmp.path(), "TOOLS.md")).unwrap();
         for tool in &[
             "shell",
             "file_read",
@@ -4703,7 +4772,7 @@ mod tests {
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul = fs::read_to_string(context_file_path(tmp.path(), "SOUL.md")).unwrap();
         assert!(
             soul.contains("Use emojis naturally (0-2 max"),
             "SOUL.md should include emoji usage guidance"
@@ -4728,10 +4797,10 @@ mod tests {
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        let user_md = fs::read_to_string(context_file_path(tmp.path(), "USER.md")).unwrap();
         assert!(user_md.contains("José María"));
 
-        let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul = fs::read_to_string(context_file_path(tmp.path(), "SOUL.md")).unwrap();
         assert!(soul.contains("ZeroClaw-v2"));
     }
 
@@ -4752,29 +4821,29 @@ mod tests {
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
         // Verify every file got personalized
-        let identity = fs::read_to_string(tmp.path().join("IDENTITY.md")).unwrap();
+        let identity = fs::read_to_string(context_file_path(tmp.path(), "IDENTITY.md")).unwrap();
         assert!(identity.contains("**Name:** Claw"));
 
-        let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul = fs::read_to_string(context_file_path(tmp.path(), "SOUL.md")).unwrap();
         assert!(soul.contains("You are **Claw**"));
         assert!(soul.contains("Be friendly, human, and conversational"));
 
-        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        let user_md = fs::read_to_string(context_file_path(tmp.path(), "USER.md")).unwrap();
         assert!(user_md.contains("**Name:** Argenis"));
         assert!(user_md.contains("**Timezone:** US/Eastern"));
         assert!(user_md.contains("**Preferred language:** English"));
         assert!(user_md.contains("Be friendly, human, and conversational"));
 
-        let agents = fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap();
+        let agents = fs::read_to_string(context_file_path(tmp.path(), "AGENTS.md")).unwrap();
         assert!(agents.contains("Claw Personal Assistant"));
 
-        let bootstrap = fs::read_to_string(tmp.path().join("BOOTSTRAP.md")).unwrap();
+        let bootstrap = fs::read_to_string(context_file_path(tmp.path(), "BOOTSTRAP.md")).unwrap();
         assert!(bootstrap.contains("**Argenis**"));
         assert!(bootstrap.contains("US/Eastern"));
         assert!(bootstrap.contains("Start in: English."));
         assert!(bootstrap.contains("Introduce yourself as Claw"));
 
-        let heartbeat = fs::read_to_string(tmp.path().join("HEARTBEAT.md")).unwrap();
+        let heartbeat = fs::read_to_string(context_file_path(tmp.path(), "HEARTBEAT.md")).unwrap();
         assert!(heartbeat.contains("Claw"));
     }
 

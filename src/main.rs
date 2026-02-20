@@ -47,6 +47,7 @@ mod rag {
     pub use zeroclaw::rag::*;
 }
 mod config;
+mod context_files;
 mod cron;
 mod daemon;
 mod doctor;

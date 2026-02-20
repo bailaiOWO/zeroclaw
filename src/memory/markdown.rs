@@ -7,8 +7,8 @@ use tokio::fs;
 /// Markdown-based memory — plain files as source of truth
 ///
 /// Layout:
-///   workspace/MEMORY.md          — curated long-term memory (core)
-///   workspace/memory/YYYY-MM-DD.md — daily logs (append-only)
+///   workspace/contexts/MEMORY.md    — curated long-term memory (core)
+///   workspace/memory/YYYY-MM-DD.md  — daily logs (append-only)
 pub struct MarkdownMemory {
     workspace_dir: PathBuf,
 }
@@ -25,7 +25,11 @@ impl MarkdownMemory {
     }
 
     fn core_path(&self) -> PathBuf {
-        self.workspace_dir.join("MEMORY.md")
+        crate::context_files::preferred_context_file_path(&self.workspace_dir, "MEMORY.md")
+    }
+
+    fn legacy_core_path(&self) -> PathBuf {
+        crate::context_files::legacy_context_file_path(&self.workspace_dir, "MEMORY.md")
     }
 
     fn daily_path(&self) -> PathBuf {
@@ -40,6 +44,9 @@ impl MarkdownMemory {
 
     async fn append_to_file(&self, path: &Path, content: &str) -> anyhow::Result<()> {
         self.ensure_dirs().await?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
 
         let existing = if path.exists() {
             fs::read_to_string(path).await.unwrap_or_default()
@@ -100,8 +107,12 @@ impl MarkdownMemory {
         let mut entries = Vec::new();
 
         // Read MEMORY.md (core)
-        let core_path = self.core_path();
-        if core_path.exists() {
+        let core_path = if self.core_path().is_file() {
+            self.core_path()
+        } else {
+            self.legacy_core_path()
+        };
+        if core_path.is_file() {
             let content = fs::read_to_string(&core_path).await?;
             entries.extend(Self::parse_entries_from_file(
                 &core_path,

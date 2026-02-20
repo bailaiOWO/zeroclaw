@@ -1,4 +1,5 @@
 use crate::config::HeartbeatConfig;
+use crate::context_files;
 use crate::observability::{Observer, ObserverEvent};
 use anyhow::Result;
 use std::path::Path;
@@ -66,8 +67,9 @@ impl HeartbeatEngine {
 
     /// Read HEARTBEAT.md and return all parsed tasks.
     pub async fn collect_tasks(&self) -> Result<Vec<String>> {
-        let heartbeat_path = self.workspace_dir.join("HEARTBEAT.md");
-        if !heartbeat_path.exists() {
+        let heartbeat_path =
+            context_files::resolve_context_file_for_read(&self.workspace_dir, "HEARTBEAT.md");
+        if !heartbeat_path.is_file() {
             return Ok(Vec::new());
         }
         let content = tokio::fs::read_to_string(&heartbeat_path).await?;
@@ -87,8 +89,12 @@ impl HeartbeatEngine {
 
     /// Create a default HEARTBEAT.md if it doesn't exist
     pub async fn ensure_heartbeat_file(workspace_dir: &Path) -> Result<()> {
-        let path = workspace_dir.join("HEARTBEAT.md");
-        if !path.exists() {
+        let path = context_files::preferred_context_file_path(workspace_dir, "HEARTBEAT.md");
+        let legacy = context_files::legacy_context_file_path(workspace_dir, "HEARTBEAT.md");
+        if !path.exists() && !legacy.exists() {
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
             let default = "# Periodic Tasks\n\n\
                            # Add tasks below (one per line, starting with `- `)\n\
                            # The agent will check this file on each heartbeat tick.\n\
@@ -212,7 +218,7 @@ mod tests {
 
         HeartbeatEngine::ensure_heartbeat_file(&dir).await.unwrap();
 
-        let path = dir.join("HEARTBEAT.md");
+        let path = context_files::preferred_context_file_path(&dir, "HEARTBEAT.md");
         assert!(path.exists());
         let content = tokio::fs::read_to_string(&path).await.unwrap();
         assert!(content.contains("Periodic Tasks"));
@@ -226,7 +232,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let path = dir.join("HEARTBEAT.md");
+        let path = context_files::preferred_context_file_path(&dir, "HEARTBEAT.md");
         tokio::fs::write(&path, "- My custom task").await.unwrap();
 
         HeartbeatEngine::ensure_heartbeat_file(&dir).await.unwrap();
@@ -264,9 +270,12 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        tokio::fs::write(dir.join("HEARTBEAT.md"), "- A\n- B\n- C")
-            .await
-            .unwrap();
+        tokio::fs::write(
+            context_files::preferred_context_file_path(&dir, "HEARTBEAT.md"),
+            "- A\n- B\n- C",
+        )
+        .await
+        .unwrap();
 
         let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver);
         let engine = HeartbeatEngine::new(

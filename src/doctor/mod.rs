@@ -344,7 +344,7 @@ fn check_file_exists(
     cat: &'static str,
     items: &mut Vec<DiagItem>,
 ) {
-    let path = base.join(name);
+    let path = crate::context_files::resolve_context_file_for_read(base, name);
     if path.is_file() {
         items.push(DiagItem::ok(cat, format!("{name} present")));
     } else if required {

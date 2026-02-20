@@ -1216,6 +1216,39 @@ pub async fn handle_api_conversations_clear(
         );
     }
 
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let mut removed_files = 0usize;
+    let mut skipped_files = 0usize;
+    if req.all {
+        match crate::context_files::list_session_ids(&workspace_dir) {
+            Ok(session_ids) => {
+                for sid in session_ids {
+                    match crate::context_files::remove_session_file(&workspace_dir, &sid) {
+                        Ok(true) => removed_files += 1,
+                        Ok(false) => skipped_files += 1,
+                        Err(e) => {
+                            skipped_files += 1;
+                            tracing::warn!("WebUI clear session markdown failed ({sid}): {e}");
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                skipped_files += 1;
+                tracing::warn!("WebUI clear session markdown list failed: {e}");
+            }
+        }
+    } else if let Some(sid) = session {
+        match crate::context_files::remove_session_file(&workspace_dir, sid) {
+            Ok(true) => removed_files += 1,
+            Ok(false) => skipped_files += 1,
+            Err(e) => {
+                skipped_files += 1;
+                tracing::warn!("WebUI clear session markdown failed ({sid}): {e}");
+            }
+        }
+    }
+
     let entries = match state
         .mem
         .list(
@@ -1256,9 +1289,14 @@ pub async fn handle_api_conversations_clear(
 
     (
         StatusCode::OK,
-        Json(
-            serde_json::json!({ "status": "ok", "total": total, "removed": removed, "skipped": skipped }),
-        ),
+        Json(serde_json::json!({
+            "status": "ok",
+            "total": total,
+            "removed": removed,
+            "skipped": skipped,
+            "session_files_removed": removed_files,
+            "session_files_skipped": skipped_files,
+        })),
     )
 }
 
@@ -1329,7 +1367,7 @@ pub struct IdentityUpdateReq {
     pub set_active: bool,
 }
 
-/// POST /api/identity — save to identities/ dir and optionally activate (copy to IDENTITY.md).
+/// POST /api/identity — save to identities/ dir and optionally activate (copy to contexts/IDENTITY.md).
 pub async fn handle_api_identity_post(
     State(state): State<AppState>,
     body: Result<Json<IdentityUpdateReq>, axum::extract::rejection::JsonRejection>,
@@ -1363,8 +1401,10 @@ pub async fn handle_api_identity_post(
     }
 
     if req.set_active {
-        // Copy content into IDENTITY.md at workspace root
-        let identity_md = config.workspace_dir.join("IDENTITY.md");
+        let _ = crate::context_files::ensure_context_dir(&config.workspace_dir);
+        // Copy content into contexts/IDENTITY.md (fallback root files remain readable)
+        let identity_md =
+            crate::context_files::preferred_context_file_path(&config.workspace_dir, "IDENTITY.md");
         let _ = std::fs::write(&identity_md, &req.content);
         config.identity.aieos_path = Some(filename.to_string());
         if let Err(e) = config.save() {
@@ -1786,26 +1826,32 @@ fn load_non_admin_context_preview(
     config: &crate::config::Config,
     workspace: &std::path::Path,
 ) -> (String, String) {
-    let relative = config
+    let configured = config
         .channels_config
         .onebot_v11
         .as_ref()
         .map(|cfg| cfg.non_admin_context_file.trim())
-        .filter(|value| !value.is_empty())
-        .unwrap_or("NON_ADMIN.md");
-
-    let abs = if std::path::Path::new(relative).is_absolute() {
-        std::path::PathBuf::from(relative)
+        .unwrap_or_default();
+    let relative = if configured.is_empty() {
+        crate::context_files::DEFAULT_NON_ADMIN_CONTEXT_FILE
     } else {
-        workspace.join(relative)
+        configured
     };
+
+    let abs = crate::context_files::resolve_non_admin_context_path(workspace, relative);
 
     let content = std::fs::read_to_string(&abs)
         .ok()
         .filter(|text| !text.trim().is_empty())
         .unwrap_or_else(|| "（文件为空或不存在）".to_string());
 
-    (relative.to_string(), content)
+    let display = abs
+        .strip_prefix(workspace)
+        .ok()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|| relative.to_string());
+
+    (display, content)
 }
 
 fn build_context_flow_variants(
@@ -1990,42 +2036,44 @@ pub async fn handle_api_context_files_get(
     let is_aieos = config.identity.format.trim().eq_ignore_ascii_case("aieos");
 
     let mut candidates: Vec<ContextFileCandidate> = Vec::new();
-    let openclaw_files = [
-        "AGENTS.md",
-        "SOUL.md",
-        "TOOLS.md",
-        "IDENTITY.md",
-        "USER.md",
-        "HEARTBEAT.md",
-        "BOOTSTRAP.md",
-        "MEMORY.md",
-        "NON_ADMIN.md",
-    ];
+    for name in crate::context_files::OPENCLAW_CONTEXT_FILES {
+        let preferred = crate::context_files::preferred_context_file_path(&workspace, name);
+        let resolved = crate::context_files::resolve_context_file_for_read(&workspace, name);
+        let display_path = if resolved == preferred {
+            crate::context_files::context_file_relative_path(name)
+        } else {
+            name.to_string()
+        };
 
-    for name in openclaw_files {
         push_file_candidate(
             &mut candidates,
             format!("openclaw:{name}"),
             name,
-            name,
-            workspace.join(name),
+            display_path,
+            resolved,
             !is_aieos && name != "NON_ADMIN.md",
         );
     }
 
     if let Some(onebot) = config.channels_config.onebot_v11.as_ref() {
         let configured = onebot.non_admin_context_file.trim();
-        if !configured.is_empty() && configured != "NON_ADMIN.md" {
-            let abs = if std::path::Path::new(configured).is_absolute() {
-                std::path::PathBuf::from(configured)
-            } else {
-                workspace.join(configured)
-            };
+        if !configured.is_empty()
+            && !configured.eq_ignore_ascii_case("NON_ADMIN.md")
+            && !configured
+                .eq_ignore_ascii_case(crate::context_files::DEFAULT_NON_ADMIN_CONTEXT_FILE)
+        {
+            let abs = crate::context_files::resolve_non_admin_context_path(&workspace, configured);
+            let display = abs
+                .strip_prefix(&workspace)
+                .ok()
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|| configured.to_string());
+
             push_file_candidate(
                 &mut candidates,
                 "onebot:non_admin_context",
                 "OneBot 非管理员上下文",
-                configured,
+                display,
                 abs,
                 false,
             );
@@ -2137,11 +2185,11 @@ pub async fn handle_api_context_files_get(
             "点击每张卡片可展开完整内容；箭头表示注入到模型的先后顺序。".to_string(),
             "OpenClaw 的 Markdown 上下文文件（AGENTS/SOUL/TOOLS/IDENTITY/USER/HEARTBEAT/BOOTSTRAP/MEMORY）已拆分为独立卡片，不再聚合成单一 System 卡片。"
                 .to_string(),
-            "管理员/非管理员切换用于对比 sender context、NON_ADMIN.md、工具权限与外网命令策略差异。"
+            "管理员/非管理员切换用于对比 sender context、contexts/NON_ADMIN.md、工具权限与外网命令策略差异。"
                 .to_string(),
             "聊天记录卡片来自 memory.conversation 的最近会话；记忆召回卡片展示结构示意，真实内容会随实时消息变化。"
                 .to_string(),
-            "文件候选列表仍保留在接口返回中，便于调试（包括 AGENTS/SOUL/IDENTITY/NON_ADMIN 等磁盘内容）。"
+            "文件候选列表仍保留在接口返回中，便于调试（优先显示 contexts/ 目录；兼容旧版根目录文件）。"
                 .to_string(),
             "管理员工具白名单策略以 channels_config.onebot_v11.admin_users/admin_only_tools 为准；命令外网访问策略以 command_external_network_access（off/on/admin_only）为准。"
                 .to_string(),
@@ -2272,8 +2320,8 @@ fn openclaw_scaffold_files() -> [&'static str; 9] {
     ]
 }
 
-fn openclaw_scaffold_subdirs() -> [&'static str; 5] {
-    ["sessions", "memory", "state", "cron", "skills"]
+fn openclaw_scaffold_subdirs() -> [&'static str; 6] {
+    ["sessions", "memory", "state", "cron", "skills", "contexts"]
 }
 
 /// GET /api/onboard/status — detect whether the first-run wizard should be shown.
@@ -2288,11 +2336,11 @@ pub async fn handle_api_onboard_status(State(state): State<AppState>) -> impl In
     let mut present_files: Vec<String> = Vec::new();
     let mut missing_files: Vec<String> = Vec::new();
     for f in openclaw_scaffold_files() {
-        let p = workspace_dir.join(f);
-        if p.is_file() {
-            present_files.push(f.to_string());
+        let display = crate::context_files::context_file_relative_path(f);
+        if crate::context_files::openclaw_context_file_exists(workspace_dir, f) {
+            present_files.push(display);
         } else {
-            missing_files.push(f.to_string());
+            missing_files.push(display);
         }
     }
 
@@ -2318,7 +2366,7 @@ pub async fn handle_api_onboard_status(State(state): State<AppState>) -> impl In
 
     let openclaw_files_ok = ["SOUL.md", "AGENTS.md", "IDENTITY.md", "USER.md"]
         .iter()
-        .all(|f| workspace_dir.join(f).is_file());
+        .all(|f| crate::context_files::openclaw_context_file_exists(workspace_dir, f));
 
     let looks_configured = if identity_is_aieos {
         provider_ok && model_ok && aieos_configured
@@ -2399,12 +2447,16 @@ fn refresh_onboard_personalization_files(
         ];
         let mut updated = Vec::new();
         for name in targets {
-            let src = temp_dir.join(name);
+            let src = crate::context_files::preferred_context_file_path(&temp_dir, name);
             if !src.is_file() {
                 continue;
             }
             let bytes = std::fs::read(&src)?;
-            std::fs::write(workspace_dir.join(name), bytes)?;
+            let dst = crate::context_files::preferred_context_file_path(workspace_dir, name);
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(dst, bytes)?;
             updated.push(name.to_string());
         }
         Ok(updated)
@@ -2435,7 +2487,7 @@ pub async fn handle_api_onboard_scaffold(
 
     let before: HashSet<String> = openclaw_scaffold_files()
         .iter()
-        .filter(|f| workspace_dir.join(*f).is_file())
+        .filter(|f| crate::context_files::openclaw_context_file_exists(&workspace_dir, f))
         .map(|s| s.to_string())
         .collect();
 
@@ -2490,7 +2542,7 @@ pub async fn handle_api_onboard_scaffold(
 
     let after: HashSet<String> = openclaw_scaffold_files()
         .iter()
-        .filter(|f| workspace_dir.join(*f).is_file())
+        .filter(|f| crate::context_files::openclaw_context_file_exists(&workspace_dir, f))
         .map(|s| s.to_string())
         .collect();
 

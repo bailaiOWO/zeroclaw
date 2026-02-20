@@ -365,7 +365,8 @@ mod tests {
             admin_users: vec![],
             admin_only_tools: vec![],
             command_external_network_access: OneBotCommandExternalNetworkAccess::Off,
-            non_admin_context_file: "NON_ADMIN.md".to_string(),
+            non_admin_context_file: crate::context_files::DEFAULT_NON_ADMIN_CONTEXT_FILE
+                .to_string(),
             message_merge_window_secs: 10,
             interrupt_on_recall: true,
             vision_input_enabled: false,

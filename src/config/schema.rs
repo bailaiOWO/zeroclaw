@@ -1803,7 +1803,7 @@ fn default_onebot_require_at_in_group() -> bool {
 }
 
 fn default_onebot_non_admin_context_file() -> String {
-    "NON_ADMIN.md".to_string()
+    crate::context_files::DEFAULT_NON_ADMIN_CONTEXT_FILE.to_string()
 }
 
 fn default_onebot_message_merge_window_secs() -> u64 {
@@ -3941,7 +3941,10 @@ api_url = "http://127.0.0.1:3000"
             parsed.command_external_network_access,
             OneBotCommandExternalNetworkAccess::Off
         );
-        assert_eq!(parsed.non_admin_context_file, "NON_ADMIN.md");
+        assert_eq!(
+            parsed.non_admin_context_file,
+            crate::context_files::DEFAULT_NON_ADMIN_CONTEXT_FILE
+        );
         assert_eq!(parsed.message_merge_window_secs, 10);
         assert!(parsed.interrupt_on_recall);
         assert!(!parsed.vision_input_enabled);

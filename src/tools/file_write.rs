@@ -43,10 +43,14 @@ impl Tool for FileWriteTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let path = args
+        let raw_path = args
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
+        let path = crate::context_files::map_context_tool_path_alias(
+            &self.security.workspace_dir,
+            raw_path,
+        );
 
         let content = args
             .get("content")
@@ -70,7 +74,7 @@ impl Tool for FileWriteTool {
         }
 
         // Security check: validate path is within workspace
-        if !self.security.is_path_allowed(path) {
+        if !self.security.is_path_allowed(&path) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -78,7 +82,7 @@ impl Tool for FileWriteTool {
             });
         }
 
-        let full_path = self.security.workspace_dir.join(path);
+        let full_path = self.security.workspace_dir.join(&path);
 
         let Some(parent) = full_path.parent() else {
             return Ok(ToolResult {
